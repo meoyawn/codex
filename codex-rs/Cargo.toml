@@ -114,7 +114,6 @@ members = [
     "tui",
     "user-verification",
     "tools",
-    "v8-poc",
     "websocket-auth",
     "websocket-client",
     "windows-sandbox-rs/tests/support",
@@ -323,7 +322,6 @@ codex-utils-stream-parser = { path = "utils/stream-parser" }
 codex-utils-string = { path = "utils/string" }
 codex-utils-template = { path = "utils/template" }
 codex-user-verification = { path = "user-verification" }
-codex-v8-poc = { path = "v8-poc" }
 codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 codex-windows-sandbox-test-support = { path = "windows-sandbox-rs/tests/support" }
@@ -548,6 +546,7 @@ unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2.1"
+rquickjs = { version = "=0.14.0", features = ["loader"] }
 uuid = "1"
 v8 = "=152.2.0"
 vt100 = "0.16.2"
@@ -623,7 +622,6 @@ unwrap_used = "deny"
 ignored = [
     "icu_provider",
     "openssl-sys",
-    "codex-v8-poc",
 ]
 
 [profile.dev]

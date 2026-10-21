@@ -61,7 +61,6 @@ use codex_history::HistoryInitialization;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
-use codex_install_context::InstallContext;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
@@ -602,10 +601,7 @@ impl ThreadManager {
             if config.features.enabled(Feature::CodeModeHost)
                 || config.code_mode.disable_in_process_fallback
             {
-                Self::process_code_mode_session_provider(
-                    config,
-                    InstallContext::current().code_mode_host_program(),
-                )
+                Arc::new(codex_code_mode::InProcessCodeModeSessionProvider)
             } else {
                 Arc::new(DisabledCodeModeSessionProvider)
             };

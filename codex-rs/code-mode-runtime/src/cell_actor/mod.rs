@@ -97,7 +97,7 @@ impl CellActor {
 struct CellContext {
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_control_tx: std::sync::mpsc::Sender<RuntimeControlCommand>,
-    runtime_terminate_handle: v8::IsolateHandle,
+    runtime_terminate_handle: crate::runtime::RuntimeTerminateHandle,
     cell_state: Arc<CellState>,
 }
 
@@ -620,7 +620,7 @@ fn resume_for_observation(
 fn begin_termination(
     runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
-    runtime_terminate_handle: &v8::IsolateHandle,
+    runtime_terminate_handle: &crate::runtime::RuntimeTerminateHandle,
     cancellation_token: &CancellationToken,
 ) {
     cancellation_token.cancel();
