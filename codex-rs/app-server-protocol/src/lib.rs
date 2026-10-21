@@ -40,6 +40,7 @@ pub use protocol::v1::GetConversationSummaryResponse;
 pub use protocol::v1::GitDiffToRemoteParams;
 pub use protocol::v1::GitDiffToRemoteResponse;
 pub use protocol::v1::GitSha;
+pub use protocol::v1::HarnessBuildIdentity;
 pub use protocol::v1::InitializeCapabilities;
 pub use protocol::v1::InitializeParams;
 pub use protocol::v1::InitializeResponse;

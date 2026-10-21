@@ -223,6 +223,7 @@ struct ForkHistory {
     snapshot: ForkSnapshot,
     initial_history: InitialHistory,
     persistence: ForkPersistence,
+    source_is_external: bool,
 }
 
 /// Preserve legacy `fork_legacy_thread(usize, ...)` callsites by mapping them to the
@@ -339,6 +340,7 @@ struct ThreadSpawnRequest {
     parent_thread_id: Option<ThreadId>,
     parent_originator: Option<String>,
     forked_from_thread_id: Option<ThreadId>,
+    fork_source_is_external: bool,
     fork_persistence: ForkPersistence,
     inherited_environments: Option<TurnEnvironmentSnapshot>,
     inherited_instructions: Option<SessionInstructions>,
@@ -360,6 +362,7 @@ impl ThreadSpawnRequest {
             parent_thread_id: None,
             parent_originator: None,
             forked_from_thread_id: None,
+            fork_source_is_external: false,
             fork_persistence: ForkPersistence::Copied,
             inherited_environments: None,
             inherited_instructions: None,
@@ -1563,9 +1566,42 @@ impl ThreadManager {
                 snapshot: snapshot.into(),
                 initial_history: history,
                 persistence: ForkPersistence::Copied,
+                source_is_external: false,
             },
         )
         .await
+    }
+
+    /// Local portable-history extension. Start a fresh root with a complete typed copied replay.
+    /// Foreign source IDs are provenance only: never inherit a coincidentally loaded local source,
+    /// instruction callback, attachment membership or runtime merely because its UUID matches.
+    pub async fn fork_thread_from_portable_history(
+        &self,
+        options: StartThreadOptions,
+        lines: Vec<codex_rollout::RolloutLine>,
+    ) -> CodexResult<NewThread> {
+        if options.config.ephemeral || !self.state.thread_store.supports_portable_history()
+            || options.session_source.as_ref().is_some_and(SessionSource::is_non_root_agent)
+            || options.thread_source.as_ref().is_some_and(|source| matches!(source, ThreadSource::Subagent | ThreadSource::GuardianReview))
+        {
+            return Err(CodexErr::InvalidRequest("portable history requires a durable compatible local store".to_string()));
+        }
+        let source_thread_id = match lines.first().map(|line| &line.item) {
+            Some(RolloutItem::SessionMeta(meta)) => meta.meta.id,
+            _ => return Err(CodexErr::InvalidRequest("portable history has no canonical source".to_string())),
+        };
+        let history = InitialHistory::Resumed(ResumedHistory {
+            history_revision: None, conversation_id: source_thread_id,
+            history: Arc::new(lines.iter().map(|line| line.item.clone()).collect()),
+            rollout_path: None,
+        });
+        self.fork_thread_with_initial_history(options, ForkHistory {
+            snapshot: ForkSnapshot::Interrupted, initial_history: history,
+            persistence: ForkPersistence::Portable {
+                inherited_item_count: lines.len(), lines: Some(Arc::new(lines)),
+            },
+            source_is_external: true,
+        }).await
     }
 
     /// Fork prepared reference-backed history using the same snapshot semantics as copied forks.
@@ -1591,6 +1627,7 @@ impl ThreadManager {
                     snapshot: ForkSnapshot::Interrupted,
                     initial_history: history,
                     persistence: fork_persistence,
+                    source_is_external: false,
                 },
             )
             .await;
@@ -1607,6 +1644,7 @@ impl ThreadManager {
             snapshot,
             initial_history: history,
             persistence: fork_persistence,
+            source_is_external,
         } = fork_history;
         // `forked_from_id()` describes this history's existing lineage. When
         // forking a resumed thread, the child copies the resumed thread itself.
@@ -1615,6 +1653,7 @@ impl ThreadManager {
             InitialHistory::Forked(_) => history.forked_from_id(),
             InitialHistory::New | InitialHistory::Cleared => None,
         };
+        let local_source_thread_id = source_thread_id.filter(|_| !source_is_external);
         // Capture the live source before later startup work can unload it. Keep
         // the fork's own providers, not the source's task-bound callback.
         let instructions = self
@@ -1625,20 +1664,25 @@ impl ThreadManager {
                     .as_ref()
                     .unwrap_or(&self.state.session_source),
                 /*parent_thread_id*/ None,
-                source_thread_id,
+                local_source_thread_id,
                 options.thread_instructions_provider.clone(),
             )
             .await;
-        let multi_agent_version = self
-            .state
-            .effective_multi_agent_version_for_spawn(
+        let multi_agent_version = if source_is_external {
+            // The portable header carries the frozen source runtime version. Do not let the
+            // Resumed wrapper look up that foreign UUID in the destination manager.
+            options.config.multi_agent_version_override()
+                .or_else(|| history.get_multi_agent_version())
+                .unwrap_or_else(|| options.config.multi_agent_version_from_features())
+        } else {
+            self.state.effective_multi_agent_version_for_spawn(
                 &history,
                 /*session_source*/ None,
                 /*parent_thread_id*/ None,
-                source_thread_id,
+                local_source_thread_id,
                 &options.config,
-            )
-            .await;
+            ).await
+        };
         let interrupted_marker = InterruptedTurnHistoryMarker::from_config_and_version(
             &options.config,
             multi_agent_version,
@@ -1648,6 +1692,7 @@ impl ThreadManager {
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
         request.forked_from_thread_id = source_thread_id;
+        request.fork_source_is_external = source_is_external;
         request.fork_persistence = fork_persistence;
         request.inherited_instructions = Some(instructions);
         Box::pin(self.state.spawn_thread(request)).await
@@ -2076,16 +2121,18 @@ impl ThreadManagerState {
             parent_thread_id,
             parent_originator,
             forked_from_thread_id,
+            fork_source_is_external,
             fork_persistence,
             inherited_environments,
             inherited_instructions,
             inherited_exec_policy,
             user_shell_override,
         } = request;
+        let local_forked_from_thread_id = forked_from_thread_id.filter(|_| !fork_source_is_external);
         let history_initialization = if matches!(
             &options.initial_history,
             InitialHistory::New | InitialHistory::Forked(_)
-        ) && let Some(source_thread_id) = forked_from_thread_id
+        ) && let Some(source_thread_id) = local_forked_from_thread_id
         {
             if let Ok(source) = self.get_thread(source_thread_id).await
                 && source.agent_status().await != AgentStatus::Shutdown
@@ -2262,7 +2309,7 @@ impl ThreadManagerState {
                             self.instructions_for_spawn(
                                 &session_source,
                                 parent_thread_id,
-                                forked_from_thread_id,
+                                local_forked_from_thread_id,
                                 thread_instructions_provider,
                             )
                             .await
@@ -2275,7 +2322,7 @@ impl ThreadManagerState {
                         &initial_history,
                         Some(&session_source),
                         parent_thread_id,
-                        forked_from_thread_id,
+                        local_forked_from_thread_id,
                     )
                     .await,
                 )
@@ -2296,7 +2343,7 @@ impl ThreadManagerState {
                 metrics_service_name.as_deref(),
                 &session_source,
                 parent_thread_id,
-                forked_from_thread_id,
+                local_forked_from_thread_id,
                 parent_originator,
             )
             .await;
@@ -2318,7 +2365,7 @@ impl ThreadManagerState {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
         let attachment_source =
-            forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
+            local_forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
         let spawn_result = Session::spawn(SessionSpawnArgs {
             startup,
             config,
