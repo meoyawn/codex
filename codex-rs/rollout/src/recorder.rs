@@ -130,6 +130,10 @@ enum RolloutCmd {
     ReadUnpersistedSessionMeta {
         ack: oneshot::Sender<Option<SessionMeta>>,
     },
+    AddPortableLines {
+        lines: Vec<crate::RolloutLine>,
+        ack: oneshot::Sender<std::io::Result<()>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -1075,6 +1079,15 @@ impl RolloutRecorder {
             })
     }
 
+    /// Seed a fresh lazy recorder with a validated portable prefix. Preserve source timestamps,
+    /// but allocate ordinals from the destination writer. This is not a generic raw append API.
+    pub async fn record_portable_lines(&self, lines: Vec<crate::RolloutLine>) -> std::io::Result<()> {
+        let (ack, received) = oneshot::channel();
+        self.tx.send(RolloutCmd::AddPortableLines { lines, ack }).await
+            .map_err(|error| IoError::other(format!("failed to queue portable history: {error}")))?;
+        received.await.map_err(|error| IoError::other(format!("portable history writer stopped: {error}")))?
+    }
+
     /// Materialize the rollout file and persist all buffered items.
     ///
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
@@ -1817,7 +1830,7 @@ struct RolloutWriterState {
     writer: Option<JsonlWriter>,
     /// True until a newly created rollout is first materialized.
     deferred_creation: bool,
-    pending_items: Vec<RolloutItem>,
+    pending_items: Vec<PendingRolloutItem>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
     rollout_path: PathBuf,
@@ -1825,9 +1838,26 @@ struct RolloutWriterState {
     last_logged_error: Option<String>,
 }
 
+struct PendingRolloutItem {
+    item: RolloutItem,
+    timestamp: Option<String>,
+}
+
 impl RolloutWriterState {
     fn add_items(&mut self, items: Vec<RolloutItem>) {
-        self.pending_items.extend(items);
+        self.pending_items.extend(items.into_iter().map(|item| PendingRolloutItem {
+            item, timestamp: None,
+        }));
+    }
+
+    fn add_portable_lines(&mut self, lines: Vec<crate::RolloutLine>) -> std::io::Result<()> {
+        if !self.deferred_creation || self.meta.is_none() || !self.pending_items.is_empty() {
+            return Err(IoError::other("portable history requires an untouched fresh recorder"));
+        }
+        self.pending_items.extend(lines.into_iter().map(|line| PendingRolloutItem {
+            item: line.item, timestamp: Some(line.timestamp),
+        }));
+        Ok(())
     }
 
     async fn flush_if_materialized(&mut self) {
@@ -1952,7 +1982,7 @@ impl RolloutWriterState {
         let mut write_result = Ok(());
         for item in &self.pending_items {
             match self.ordinal_state.current() {
-                Ok(ordinal) => match writer.write_rollout_item(item, ordinal).await {
+                Ok(ordinal) => match writer.write_rollout_item_at(&item.item, ordinal, item.timestamp.as_deref()).await {
                     Ok(()) => self.ordinal_state.advance(),
                     Err(err) => {
                         write_result = Err(err);
@@ -1993,6 +2023,9 @@ async fn rollout_writer(
             RolloutCmd::AddItems(items) => {
                 state.add_items(items);
                 state.flush_if_materialized().await;
+            }
+            RolloutCmd::AddPortableLines { lines, ack } => {
+                let _ = ack.send(state.add_portable_lines(lines));
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -2124,12 +2157,24 @@ impl JsonlWriter {
         rollout_item: &RolloutItem,
         ordinal: Option<u64>,
     ) -> std::io::Result<()> {
+        self.write_rollout_item_at(rollout_item, ordinal, None).await
+    }
+
+    async fn write_rollout_item_at(
+        &mut self,
+        rollout_item: &RolloutItem,
+        ordinal: Option<u64>,
+        retained_timestamp: Option<&str>,
+    ) -> std::io::Result<()> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
-        let timestamp = OffsetDateTime::now_utc()
-            .format(timestamp_format)
-            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+        let timestamp = match retained_timestamp {
+            Some(timestamp) => timestamp.to_string(),
+            None => OffsetDateTime::now_utc()
+                .format(timestamp_format)
+                .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?,
+        };
 
         let line = RolloutLineRef {
             timestamp,

@@ -178,6 +178,22 @@ impl LiveThread {
         Ok(live_thread)
     }
 
+    /// Portable roots persist complete raw replay before session startup is acknowledged.
+    /// All source timestamps survive; the destination recorder assigns new physical ordinals.
+    pub async fn create_with_portable_history(
+        thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+        lines: Vec<codex_rollout::RolloutLine>,
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
+        let live = guard.acquire(Self::create(thread_store, params)).await?;
+        let items = lines.iter().map(|line| line.item.clone()).collect::<Vec<_>>();
+        live.thread_store.append_portable_history(live.thread_id, lines).await?;
+        live.observe_appended_items(&items).await?;
+        live.persist(PersistContext::Standard).await?;
+        Ok(live)
+    }
+
     /// Reopens persistence and returns the replay history selected under writer ownership.
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,
@@ -231,11 +247,15 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        self.observe_appended_items(&items).await
+    }
+
+    async fn observe_appended_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
         let update = self
             .metadata_sync
             .lock()
             .await
-            .observe_appended_items(items.as_slice());
+            .observe_appended_items(items);
         if let Some(update) = update {
             self.thread_store
                 .record_thread_metadata(UpdateThreadMetadataParams {

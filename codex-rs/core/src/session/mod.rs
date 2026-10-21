@@ -444,6 +444,12 @@ pub(crate) enum GitEnrichmentPolicy {
 /// Controls which fork history belongs in the newly created thread's own rollout.
 pub(crate) enum ForkPersistence {
     Copied,
+    /// Complete raw copied replay from another host, with original record timestamps.
+    Portable {
+        // Consumed during startup acquisition; the live session retains only the prefix count.
+        lines: Option<Arc<Vec<codex_rollout::RolloutLine>>>,
+        inherited_item_count: usize,
+    },
     /// The spawn caller owns the durability barrier before acknowledging the child.
     CopiedDeferred,
     Referenced {
@@ -1757,6 +1763,13 @@ impl Session {
                 let thread_settings_applied =
                     RolloutItem::EventMsg(thread_settings::applied_event(self).await);
                 match &self.fork_persistence {
+                    ForkPersistence::Portable { inherited_item_count, .. } => {
+                        // The startup acquisition guard already persisted the complete raw prefix
+                        // with original timestamps. Persist only destination-effective settings and
+                        // any interrupt marker synthesized after that prefix.
+                        rollout_items.drain(..*inherited_item_count);
+                        rollout_items.insert(0, thread_settings_applied);
+                    }
                     ForkPersistence::Referenced {
                         inherited_item_count,
                         ..
@@ -1785,7 +1798,7 @@ impl Session {
                 // Agent spawn owns its final durability barrier so it can overlap the edge write.
                 let persist_context = match self.fork_persistence {
                     ForkPersistence::CopiedDeferred => PersistContext::SubagentSpawn,
-                    ForkPersistence::Copied | ForkPersistence::Referenced { .. } => {
+                    ForkPersistence::Copied | ForkPersistence::Portable { .. } | ForkPersistence::Referenced { .. } => {
                         PersistContext::Standard
                     }
                 };

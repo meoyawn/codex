@@ -185,6 +185,7 @@ pub(crate) struct ConnectionSessionState {
 #[derive(Debug)]
 pub(crate) struct InitializedConnectionSessionState {
     pub(crate) experimental_api_enabled: bool,
+    pub(crate) portable_history_enabled: bool,
     pub(crate) opted_out_notification_methods: HashSet<String>,
     pub(crate) app_server_client_name: String,
     pub(crate) client_version: String,
@@ -210,6 +211,10 @@ impl ConnectionSessionState {
         self.initialized
             .get()
             .is_some_and(|session| session.experimental_api_enabled)
+    }
+
+    pub(crate) fn portable_history_enabled(&self) -> bool {
+        self.initialized.get().is_some_and(|session| session.portable_history_enabled)
     }
 
     pub(crate) fn opted_out_notification_methods(&self) -> HashSet<String> {
@@ -481,6 +486,7 @@ impl MessageProcessor {
             config_warnings.clone(),
             rpc_transport,
             Arc::clone(&user_verification),
+            thread_store.supports_portable_history(),
         );
         let marketplace_processor =
             MarketplaceRequestProcessor::new(config_manager.clone(), Arc::clone(&thread_manager));
@@ -996,6 +1002,14 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+        if matches!(&codex_request,
+            ClientRequest::ThreadPortableHistoryExport { .. }
+                | ClientRequest::ThreadPortableHistoryImport { .. }
+                | ClientRequest::ThreadPortableHistoryRelease { .. })
+            && !session.portable_history_enabled()
+        {
+            return Err(invalid_request("portable history was not negotiated on this connection"));
+        }
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -1006,6 +1020,7 @@ impl MessageProcessor {
         let (turn_admission, recheck_turn_admission) = match &codex_request {
             ClientRequest::ThreadStart { .. }
             | ClientRequest::ThreadFork { .. }
+            | ClientRequest::ThreadPortableHistoryImport { .. }
             | ClientRequest::ThreadResume { .. }
             | ClientRequest::ThreadRevert { .. }
             | ClientRequest::ThreadSettingsUpdate { .. }
@@ -1356,6 +1371,18 @@ impl MessageProcessor {
                     })
                     .await;
                 Ok(Some(ThreadSampleCancelResponse {}.into()))
+            }
+            ClientRequest::ThreadPortableHistoryExport { params, .. } => {
+                self.thread_processor.thread_portable_history_export(request_id.clone(), params).await
+            }
+            ClientRequest::ThreadPortableHistoryRelease { params, .. } => {
+                self.thread_processor.thread_portable_history_release(request_id.clone(), params).await
+            }
+            ClientRequest::ThreadPortableHistoryImport { params, .. } => {
+                self.thread_processor.thread_portable_history_import(
+                    request_id.clone(), params, app_server_client_name.clone(), client_version.clone(),
+                    client_mcp_extensions.clone(),
+                ).await
             }
             ClientRequest::ThreadArchive { params, .. } => {
                 self.thread_processor

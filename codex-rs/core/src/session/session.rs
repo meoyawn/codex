@@ -815,7 +815,7 @@ impl Session {
         agent_status: watch::Sender<AgentStatus>,
         mut initial_history: InitialHistory,
         history_initialization: HistoryInitialization,
-        fork_persistence: ForkPersistence,
+        mut fork_persistence: ForkPersistence,
         session_source: SessionSource,
         skills_service: Arc<HostSkillsService>,
         plugins_manager: Arc<PluginsManager>,
@@ -876,6 +876,7 @@ impl Session {
             ForkPersistence::Referenced { history_base, .. } => {
                 history_base.map(|position| position.end_ordinal_exclusive)
             }
+            ForkPersistence::Portable { .. } => None,
             ForkPersistence::Copied | ForkPersistence::CopiedDeferred => match &initial_history {
                 InitialHistory::Resumed(resumed) => {
                     // Both local and CCA thread stores place the resumed thread's
@@ -1095,7 +1096,7 @@ impl Session {
                             multi_agent_version: initial_multi_agent_version,
                             history_mode: session_configuration.history_mode,
                             history_base: match &fork_persistence {
-                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred => None,
+                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred | ForkPersistence::Portable { .. } => None,
                                 ForkPersistence::Referenced { history_base, .. } => *history_base,
                             },
                             subagent_history_start_ordinal: None,
@@ -1113,7 +1114,24 @@ impl Session {
                                 },
                             },
                         };
-                        if is_paginated_subagent
+                        if let ForkPersistence::Portable { lines, .. } = &mut fork_persistence {
+                            let InitialHistory::Forked(items) = &initial_history else {
+                                return Err(anyhow::anyhow!("portable persistence requires copied fork history"));
+                            };
+                            let lines = lines.take().ok_or_else(|| anyhow::anyhow!("portable prefix was already consumed"))?;
+                            if is_paginated_subagent || lines.len() > items.len() {
+                                return Err(anyhow::anyhow!("invalid portable root prefix"));
+                            }
+                            let mut lines = Arc::unwrap_or_clone(lines);
+                            for (line, item) in lines.iter_mut().zip(items.iter()) {
+                                // Session startup may assign missing response IDs. Persist those
+                                // exact reconstructed items with the source's timestamps.
+                                line.item = item.clone();
+                            }
+                            LiveThread::create_with_portable_history(
+                                Arc::clone(&thread_store), params, lines, guard,
+                            ).await?
+                        } else if is_paginated_subagent
                             && matches!(
                                 &fork_persistence,
                                 ForkPersistence::Copied | ForkPersistence::CopiedDeferred
@@ -2008,7 +2026,7 @@ impl Session {
                     initial_auto_compact_window_ids,
                 );
             }
-            if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
+            if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. } | ForkPersistence::Portable { .. }) {
                 // Keep the source reserved until the child's history reference is durable.
                 sess.try_ensure_rollout_materialized(PersistContext::Standard)
                     .await?;

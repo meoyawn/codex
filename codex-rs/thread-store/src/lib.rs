@@ -9,6 +9,7 @@ mod in_memory;
 mod live_thread;
 mod local;
 mod projects;
+pub mod portable_history;
 mod queue_store;
 mod store;
 mod thread_attachments;
