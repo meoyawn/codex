@@ -89,6 +89,18 @@ pub struct InitializeResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub harness_build: Option<HarnessBuildIdentity>,
+    /// Negotiated local client-tool support; absent on upstream servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub client_tools: Option<ClientToolsCapability>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientToolsCapability {
+    pub version: u32,
+    pub dynamic_tools_on_resume: bool,
+    pub in_process_app_mcp: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

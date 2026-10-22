@@ -3939,6 +3939,9 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         prepared_config: &mut Option<PreparedResumeConfig>,
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
+        if let Some(tools) = params.dynamic_tools.as_ref() {
+            validate_dynamic_tools(tools).map_err(invalid_request)?;
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -3996,6 +3999,7 @@ impl ThreadRequestProcessor {
 
         let ThreadResumeParams {
             thread_id,
+            dynamic_tools,
             history,
             path,
             model,
@@ -4361,6 +4365,9 @@ impl ThreadRequestProcessor {
                 {
                     self.outgoing.send_error(request_id, err).await;
                     return Ok(ControlFlow::Break(()));
+                }
+                if let Some(tools) = dynamic_tools {
+                    codex_thread.upsert_dynamic_tools(tools).await;
                 }
                 let instruction_sources = codex_thread.legacy_instruction_sources().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
@@ -4734,6 +4741,9 @@ impl ThreadRequestProcessor {
             }
             let redact_resume_payloads =
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());
+            if let Some(tools) = params.dynamic_tools.clone() {
+                existing_thread.upsert_dynamic_tools(tools).await;
+            }
             let include_turns = !params.exclude_turns;
             if paginated_resume && include_turns {
                 self.send_deprecation_notice(

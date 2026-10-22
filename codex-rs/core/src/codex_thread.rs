@@ -1006,6 +1006,11 @@ impl CodexThread {
         self.session.services.client_mcp_extensions.clone()
     }
 
+    /// Upsert capabilities supplied by a connected client for future turns.
+    pub async fn upsert_dynamic_tools(&self, tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>) {
+        self.session.upsert_dynamic_tools(tools).await;
+    }
+
     /// Returns the files that supplied the thread's loaded model instructions.
     pub async fn instruction_sources(&self) -> Vec<PathUri> {
         self.session.instruction_sources().await

@@ -272,7 +272,7 @@ impl Session {
 
     #[tracing::instrument(name = "mcp.runtime.refresh", skip_all)]
     pub(super) async fn publish_mcp_runtime(
-        &self,
+        self: &Arc<Self>,
         desired: &McpDesiredState,
         mcp_projection: McpRuntimeProjection,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
@@ -286,12 +286,13 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             desired,
             mcp_projection,
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
+        self.install_app_tools_mcp(&mut input).await;
         AuthStorageOriginator::from_client_name(&desired.originator)
             .scope(self.services.mcp_runtime.replace(input))
             .await;

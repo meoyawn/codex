@@ -1273,6 +1273,9 @@ pub(crate) async fn make_rmcp_client(
     runtime_auth_provider: Option<SharedAuthProvider>,
     protocol_mode: McpProtocolMode,
 ) -> Result<RmcpClient, StartupOutcomeError> {
+    if let Some(factory) = server.in_process_transport() {
+        return RmcpClient::new_in_process_client(factory).await.map_err(|error| StartupOutcomeError::from(anyhow!(error)));
+    }
     let config = server.config().clone();
     if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
         // Executor HTTP declarations cannot acquire host header helpers through

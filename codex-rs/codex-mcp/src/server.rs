@@ -40,6 +40,16 @@ pub struct EffectiveMcpServer {
     credential_policy: McpCredentialPolicy,
     agent_plugin: bool,
     requires_read_only_mcp_tools: bool,
+    in_process: Option<InProcessServer>,
+}
+
+#[derive(Clone)]
+struct InProcessServer {
+    identity: String,
+    factory: Arc<dyn codex_rmcp_client::InProcessTransportFactory>,
+}
+impl std::fmt::Debug for InProcessServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("InProcessServer").field("identity", &self.identity).finish_non_exhaustive() }
 }
 
 impl EffectiveMcpServer {
@@ -57,6 +67,7 @@ impl EffectiveMcpServer {
             credential_policy,
             agent_plugin: false,
             requires_read_only_mcp_tools: false,
+            in_process: None,
         }
     }
 
@@ -80,6 +91,15 @@ impl EffectiveMcpServer {
 
     pub fn config(&self) -> &McpServerConfig {
         &self.config
+    }
+
+    /// Application-owned MCP uses the same manager/policy/catalog as external
+    /// servers, with a reconnectable byte stream and no process or network I/O.
+    pub fn with_in_process_transport(mut self, identity: String, factory: Arc<dyn codex_rmcp_client::InProcessTransportFactory>) -> Self {
+        self.in_process = Some(InProcessServer { identity, factory }); self
+    }
+    pub(crate) fn in_process_transport(&self) -> Option<Arc<dyn codex_rmcp_client::InProcessTransportFactory>> {
+        self.in_process.as_ref().map(|server| Arc::clone(&server.factory))
     }
 
     pub fn enabled(&self) -> bool {
@@ -131,6 +151,7 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 /// those belong to a publication and can change without reconnecting.
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
+    in_process_identity: Option<String>,
     auth: McpServerAuth,
     pub(crate) credential_policy: McpCredentialPolicy,
     transport: McpServerTransportConfig,
@@ -258,6 +279,7 @@ impl McpServerConnectionIdentity {
 
         Self {
             auth: config.auth.clone(),
+            in_process_identity: server.in_process.as_ref().map(|server| server.identity.clone()),
             credential_policy: server.credential_policy(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
@@ -297,6 +319,7 @@ impl McpServerConnectionIdentity {
             (Some(_), None) | (None, Some(_)) => false,
         };
         self.auth == other.auth
+            && self.in_process_identity == other.in_process_identity
             && self.credential_policy == other.credential_policy
             && self.transport == other.transport
             && self.environment_id == other.environment_id
