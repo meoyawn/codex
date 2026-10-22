@@ -29,6 +29,7 @@ pub use protocol::thread_history_projection::*;
 pub use protocol::v1::ApplyPatchApprovalParams;
 pub use protocol::v1::ApplyPatchApprovalResponse;
 pub use protocol::v1::ClientInfo;
+pub use protocol::v1::ClientToolsCapability;
 pub use protocol::v1::ConversationGitInfo;
 pub use protocol::v1::ConversationSummary;
 pub use protocol::v1::ExecCommandApprovalParams;

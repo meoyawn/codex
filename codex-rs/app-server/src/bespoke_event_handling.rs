@@ -974,8 +974,15 @@ pub(crate) async fn apply_bespoke_event_handling(
                 on_request_permissions_response(pending_response, conversation, thread_state).await;
             });
         }
-        EventMsg::DynamicToolCallRequest(_)
-        | EventMsg::DynamicToolCallResponse(_)
+        EventMsg::DynamicToolCallRequest(request) => {
+            let call_id = request.call_id.clone();
+            let (_, rx) = outgoing.send_request(ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+                thread_id: conversation_id.to_string(), turn_id: request.turn_id,
+                call_id: request.call_id, namespace: request.namespace, tool: request.tool, arguments: request.arguments,
+            })).await;
+            tokio::spawn(async move { crate::dynamic_tools::on_call_response(call_id, rx, conversation).await; });
+        }
+        EventMsg::DynamicToolCallResponse(_)
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)

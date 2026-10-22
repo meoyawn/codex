@@ -680,6 +680,39 @@ impl Session {
         state.session_configuration.dynamic_tools.clone()
     }
 
+    /// Client capabilities apply to the next captured TurnContext. Never
+    /// replace the toolset of an already-running turn or remove other tools.
+    pub(crate) async fn upsert_dynamic_tools(&self, tools: Vec<DynamicToolSpec>) {
+        let mut state = self.state.lock().await;
+        let current = &mut state.session_configuration.dynamic_tools;
+        for tool in tools {
+            match tool {
+                DynamicToolSpec::Namespace(incoming) => {
+                    if let Some(DynamicToolSpec::Namespace(existing)) = current.iter_mut().find(|spec| {
+                        matches!(spec, DynamicToolSpec::Namespace(namespace) if namespace.name == incoming.name)
+                    }) {
+                        existing.description = incoming.description;
+                        for function in incoming.tools {
+                            let codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(incoming_function) = &function;
+                            if let Some(slot) = existing.tools.iter_mut().find(|candidate| {
+                                let codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(candidate) = candidate;
+                                candidate.name == incoming_function.name
+                            }) { *slot = function; } else { existing.tools.push(function); }
+                        }
+                    } else { current.push(DynamicToolSpec::Namespace(incoming)); }
+                }
+                DynamicToolSpec::Function(incoming) => {
+                    if let Some(slot) = current.iter_mut().find(|spec| {
+                        matches!(spec, DynamicToolSpec::Function(function) if function.name == incoming.name)
+                    }) { *slot = DynamicToolSpec::Function(incoming); }
+                    else { current.push(DynamicToolSpec::Function(incoming)); }
+                }
+            }
+        }
+        drop(state);
+        self.mark_mcp_runtime_dirty();
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         step_context: &StepContext,

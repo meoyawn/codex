@@ -86,6 +86,9 @@ impl InitializeRequestProcessor {
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let extensions = capabilities.extensions.as_ref();
+        let client_tools = extensions.and_then(|extensions| extensions.get("dev.harness.clientTools"))
+            .filter(|offer| experimental_api_enabled && offer.get("version").and_then(serde_json::Value::as_u64) == Some(1))
+            .map(|_| codex_app_server_protocol::ClientToolsCapability { version: 1, dynamic_tools_on_resume: true, in_process_app_mcp: true });
         let harness_build = extensions.and_then(|extensions| extensions.get("dev.harness.buildIdentity"))
             .filter(|offer| offer.get("version").and_then(serde_json::Value::as_u64) == Some(1))
             .and_then(|_| Some(codex_app_server_protocol::HarnessBuildIdentity {
@@ -236,6 +239,7 @@ impl InitializeRequestProcessor {
             platform_os: std::env::consts::OS.to_string(),
             portable_history: portable_history_enabled.then(codex_app_server_protocol::PortableHistoryCapability::v1),
             harness_build,
+            client_tools,
         };
 
         self.outgoing
