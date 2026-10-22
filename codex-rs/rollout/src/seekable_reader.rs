@@ -63,6 +63,14 @@ pub fn read_rollout_prefix(path: &Path, max_bytes: usize) -> io::Result<Option<V
     Ok(Some(bytes))
 }
 
+/// Streams decoded JSONL bytes. Callers own byte limits and cancellation between reads.
+pub fn open_rollout_stream(path: &Path) -> io::Result<Box<dyn Read>> {
+    match RolloutReader::open(path)? {
+        RolloutReader::Plain(file) => Ok(Box::new(file)),
+        RolloutReader::Compressed(file) => Ok(Box::new(zstd::stream::read::Decoder::new(file)?)),
+    }
+}
+
 /// Opens the original JSONL bytes for blocking offset reads without changing the rollout on disk.
 ///
 /// Compressed files are decoded into an anonymous temporary file, keeping memory use bounded and

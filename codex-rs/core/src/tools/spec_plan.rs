@@ -1606,6 +1606,9 @@ fn append_dynamic_tool_runtimes(dynamic_tools: &[DynamicToolSpec], registry: &mu
                 registry.register_external(Arc::new(handler));
             }
             DynamicToolSpec::Namespace(namespace) => {
+                // This reserved desktop namespace is materialized by the
+                // thread's in-process MCP server, never a second tool surface.
+                if namespace.name == "codex_app" { continue; }
                 for tool in &namespace.tools {
                     let DynamicToolNamespaceTool::Function(tool) = tool;
                     let Some(handler) = DynamicToolHandler::new_in_namespace(namespace, tool)

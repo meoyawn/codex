@@ -81,6 +81,36 @@ pub struct InitializeResponse {
     /// Operating system for the running app-server target, for example
     /// `"macos"`, `"linux"`, or `"windows"`.
     pub platform_os: String,
+    /// Negotiated local Harness extension; absent on unmodified upstream servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub portable_history: Option<crate::protocol::v2::PortableHistoryCapability>,
+    /// Build identity offered only to clients negotiating dev.harness.buildIdentity v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness_build: Option<HarnessBuildIdentity>,
+    /// Negotiated local client-tool support; absent on upstream servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub client_tools: Option<ClientToolsCapability>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientToolsCapability {
+    pub version: u32,
+    pub dynamic_tools_on_resume: bool,
+    pub in_process_app_mcp: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessBuildIdentity {
+    pub version: u32,
+    pub source_commit: String,
+    pub source_fingerprint_sha256: String,
+    pub package_version: String,
+    pub cargo_profile: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
