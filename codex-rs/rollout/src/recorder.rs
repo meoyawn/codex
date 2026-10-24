@@ -132,6 +132,7 @@ enum RolloutCmd {
     },
     AddPortableLines {
         lines: Vec<crate::RolloutLine>,
+        continuation: bool,
         ack: oneshot::Sender<std::io::Result<()>>,
     },
     Persist {
@@ -996,6 +997,7 @@ impl RolloutRecorder {
                     rollout_path: path,
                     ordinal_state,
                     last_logged_error: None,
+                    portable_prefix_open: false,
                 }
             }
             RolloutRecorderParams::Resume { path } => {
@@ -1010,6 +1012,7 @@ impl RolloutRecorder {
                     rollout_path: path,
                     ordinal_state,
                     last_logged_error: None,
+                    portable_prefix_open: false,
                 }
             }
         };
@@ -1082,8 +1085,12 @@ impl RolloutRecorder {
     /// Seed a fresh lazy recorder with a validated portable prefix. Preserve source timestamps,
     /// but allocate ordinals from the destination writer. This is not a generic raw append API.
     pub async fn record_portable_lines(&self, lines: Vec<crate::RolloutLine>) -> std::io::Result<()> {
+        self.record_portable_lines_batch(lines, false).await
+    }
+
+    pub async fn record_portable_lines_batch(&self, lines: Vec<crate::RolloutLine>, continuation: bool) -> std::io::Result<()> {
         let (ack, received) = oneshot::channel();
-        self.tx.send(RolloutCmd::AddPortableLines { lines, ack }).await
+        self.tx.send(RolloutCmd::AddPortableLines { lines, continuation, ack }).await
             .map_err(|error| IoError::other(format!("failed to queue portable history: {error}")))?;
         received.await.map_err(|error| IoError::other(format!("portable history writer stopped: {error}")))?
     }
@@ -1836,6 +1843,7 @@ struct RolloutWriterState {
     rollout_path: PathBuf,
     ordinal_state: RolloutOrdinalState,
     last_logged_error: Option<String>,
+    portable_prefix_open: bool,
 }
 
 struct PendingRolloutItem {
@@ -1845,15 +1853,21 @@ struct PendingRolloutItem {
 
 impl RolloutWriterState {
     fn add_items(&mut self, items: Vec<RolloutItem>) {
+        self.portable_prefix_open = false;
         self.pending_items.extend(items.into_iter().map(|item| PendingRolloutItem {
             item, timestamp: None,
         }));
     }
 
-    fn add_portable_lines(&mut self, lines: Vec<crate::RolloutLine>) -> std::io::Result<()> {
-        if !self.deferred_creation || self.meta.is_none() || !self.pending_items.is_empty() {
+    fn add_portable_lines(&mut self, lines: Vec<crate::RolloutLine>, continuation: bool) -> std::io::Result<()> {
+        if !self.pending_items.is_empty() || if continuation {
+            !self.portable_prefix_open
+        } else {
+            !self.deferred_creation || self.meta.is_none()
+        } {
             return Err(IoError::other("portable history requires an untouched fresh recorder"));
         }
+        self.portable_prefix_open = true;
         self.pending_items.extend(lines.into_iter().map(|line| PendingRolloutItem {
             item: line.item, timestamp: Some(line.timestamp),
         }));
@@ -2024,8 +2038,8 @@ async fn rollout_writer(
                 state.add_items(items);
                 state.flush_if_materialized().await;
             }
-            RolloutCmd::AddPortableLines { lines, ack } => {
-                let _ = ack.send(state.add_portable_lines(lines));
+            RolloutCmd::AddPortableLines { lines, continuation, ack } => {
+                let _ = ack.send(state.add_portable_lines(lines, continuation));
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);

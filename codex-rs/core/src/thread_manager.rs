@@ -1611,7 +1611,7 @@ impl ThreadManager {
     pub async fn fork_thread_from_portable_history(
         &self,
         options: StartThreadOptions,
-        lines: Vec<codex_rollout::RolloutLine>,
+        portable: codex_thread_store::portable_history::ImportedPortableReplay,
     ) -> CodexResult<NewThread> {
         if options.config.ephemeral || !self.state.thread_store.supports_portable_history()
             || options.session_source.as_ref().is_some_and(SessionSource::is_non_root_agent)
@@ -1619,19 +1619,19 @@ impl ThreadManager {
         {
             return Err(CodexErr::InvalidRequest("portable history requires a durable compatible local store".to_string()));
         }
-        let source_thread_id = match lines.first().map(|line| &line.item) {
+        let source_thread_id = match portable.model_context.first() {
             Some(RolloutItem::SessionMeta(meta)) => meta.meta.id,
             _ => return Err(CodexErr::InvalidRequest("portable history has no canonical source".to_string())),
         };
         let history = InitialHistory::Resumed(ResumedHistory {
             history_revision: None, conversation_id: source_thread_id,
-            history: Arc::new(lines.iter().map(|line| line.item.clone()).collect()),
+            history: Arc::clone(&portable.model_context),
             rollout_path: None,
         });
         self.fork_thread_with_initial_history(options, ForkHistory {
             snapshot: ForkSnapshot::Interrupted, initial_history: history,
             persistence: ForkPersistence::Portable {
-                inherited_item_count: lines.len(), lines: Some(Arc::new(lines)),
+                inherited_item_count: portable.model_context.len(), replay: Some(portable.replay),
             },
             source_is_external: true,
         }).await

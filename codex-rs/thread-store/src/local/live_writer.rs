@@ -158,7 +158,16 @@ pub(super) async fn append_portable_history(
     thread_id: ThreadId,
     lines: Vec<codex_rollout::RolloutLine>,
 ) -> ThreadStoreResult<()> {
-    write_and_project(store, thread_id, RolloutWriteOp::PortableHistory(lines)).await
+    append_portable_history_batch(store, thread_id, lines, false).await
+}
+
+pub(super) async fn append_portable_history_batch(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    lines: Vec<codex_rollout::RolloutLine>,
+    continuation: bool,
+) -> ThreadStoreResult<()> {
+    write_and_project(store, thread_id, RolloutWriteOp::PortableHistory { lines, continuation }).await
 }
 
 pub(super) async fn persist_thread(
@@ -318,7 +327,7 @@ fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
 /// new data into the SQLite history tables (turns and items) as necessary.
 enum RolloutWriteOp {
     AppendItems(Vec<RolloutItem>),
-    PortableHistory(Vec<codex_rollout::RolloutLine>),
+    PortableHistory { lines: Vec<codex_rollout::RolloutLine>, continuation: bool },
     Persist,
     Flush,
 }
@@ -362,8 +371,8 @@ async fn write_and_project(
     // teardown.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
-    let portable_prefix = matches!(&write_op, RolloutWriteOp::PortableHistory(_));
-    let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush | RolloutWriteOp::PortableHistory(_));
+    let portable_prefix = matches!(&write_op, RolloutWriteOp::PortableHistory { .. });
+    let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush | RolloutWriteOp::PortableHistory { .. });
     let write_op = match write_op {
         RolloutWriteOp::AppendItems(items) => {
             let items = into_persisted_rollout_items(items, history_mode);
@@ -372,7 +381,7 @@ async fn write_and_project(
             }
             RolloutWriteOp::AppendItems(items)
         }
-        RolloutWriteOp::PortableHistory(lines) => {
+        RolloutWriteOp::PortableHistory { lines, continuation } => {
             if history_mode != ThreadHistoryMode::Paginated {
                 return Err(crate::portable_history::invalid("portable prefix requires paginated persistence"));
             }
@@ -385,7 +394,7 @@ async fn write_and_project(
                     return Err(crate::portable_history::invalid("portable prefix would change under persistence policy"));
                 }
             }
-            RolloutWriteOp::PortableHistory(lines)
+            RolloutWriteOp::PortableHistory { lines, continuation }
         }
         RolloutWriteOp::Persist => RolloutWriteOp::Persist,
         RolloutWriteOp::Flush => RolloutWriteOp::Flush,
@@ -423,8 +432,8 @@ async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> Thr
                 .map_err(thread_store_io_error)?;
             recorder.flush().await.map_err(thread_store_io_error)
         }
-        RolloutWriteOp::PortableHistory(lines) => {
-            recorder.record_portable_lines(lines).await.map_err(thread_store_io_error)?;
+        RolloutWriteOp::PortableHistory { lines, continuation } => {
+            recorder.record_portable_lines_batch(lines, continuation).await.map_err(thread_store_io_error)?;
             recorder.persist().await.map_err(thread_store_io_error)
         }
         RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error),

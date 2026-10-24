@@ -305,6 +305,16 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    fn append_portable_history_batch(
+        &self,
+        thread_id: ThreadId,
+        lines: Vec<codex_rollout::RolloutLine>,
+        continuation: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        if !continuation { return self.append_portable_history(thread_id, lines); }
+        Box::pin(async { Err(ThreadStoreError::Unsupported { operation: "portable_history_stream" }) })
+    }
+
     /// Reverts a paginated thread's durable history so it ends immediately before
     /// `before_turn_id`.
     ///

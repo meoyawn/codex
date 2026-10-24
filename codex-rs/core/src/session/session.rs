@@ -1148,22 +1148,16 @@ impl Session {
                                 },
                             },
                         };
-                        if let ForkPersistence::Portable { lines, .. } = &mut fork_persistence {
+                        if let ForkPersistence::Portable { replay, inherited_item_count } = &mut fork_persistence {
                             let InitialHistory::Forked(items) = &initial_history else {
                                 return Err(anyhow::anyhow!("portable persistence requires copied fork history"));
                             };
-                            let lines = lines.take().ok_or_else(|| anyhow::anyhow!("portable prefix was already consumed"))?;
-                            if is_paginated_subagent || lines.len() > items.len() {
+                            let replay = replay.take().ok_or_else(|| anyhow::anyhow!("portable prefix was already consumed"))?;
+                            if is_paginated_subagent || *inherited_item_count > items.len() {
                                 return Err(anyhow::anyhow!("invalid portable root prefix"));
                             }
-                            let mut lines = Arc::unwrap_or_clone(lines);
-                            for (line, item) in lines.iter_mut().zip(items.iter()) {
-                                // Session startup may assign missing response IDs. Persist those
-                                // exact reconstructed items with the source's timestamps.
-                                line.item = item.clone();
-                            }
-                            LiveThread::create_with_portable_history(
-                                Arc::clone(&thread_store), params, lines, guard,
+                            LiveThread::create_with_portable_replay(
+                                Arc::clone(&thread_store), params, replay, &items[..*inherited_item_count], guard,
                             ).await?
                         } else if is_paginated_subagent
                             && matches!(

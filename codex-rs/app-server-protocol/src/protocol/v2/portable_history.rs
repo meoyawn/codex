@@ -11,8 +11,10 @@ pub const PORTABLE_HISTORY_EXTENSION: &str = "dev.harness.portableHistory";
 pub const PORTABLE_HISTORY_VERSION: u32 = 1;
 // Both peers must implement this exact raw-rollout interpretation, not merely the same CLI version.
 pub const PORTABLE_HISTORY_ROLLOUT_SCHEMA: &str = "codex-83086188ae0614bd882818ff1aa23f3194962012-harness-portable-v1";
-pub const PORTABLE_HISTORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
-pub const PORTABLE_HISTORY_MAX_LINE_BYTES: u64 = 32 * 1024 * 1024;
+// The artifact is streamed to disk. Bound lengths to exact JSON integers
+// rather than imposing handoff-only conversation or record size policies.
+pub const PORTABLE_HISTORY_MAX_BYTES: u64 = (1_u64 << 53) - 1;
+pub const PORTABLE_HISTORY_MAX_LINE_BYTES: u64 = PORTABLE_HISTORY_MAX_BYTES;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

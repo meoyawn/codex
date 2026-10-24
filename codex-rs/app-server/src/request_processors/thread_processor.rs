@@ -5218,7 +5218,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
-        mut portable: Option<codex_thread_store::portable_history::ImportedPortableHistory>,
+        mut portable: Option<codex_thread_store::portable_history::ImportedPortableReplay>,
     ) -> Result<(), JSONRPCErrorError> {
         if params.experimental_disable_prediction_mcp && !params.experimental_prediction_mode {
             return Err(invalid_request(
@@ -5427,7 +5427,7 @@ impl ThreadRequestProcessor {
             None
         };
         let source_history_items = if let Some(portable) = portable.as_ref() {
-            Arc::new(portable.lines.iter().map(|line| line.item.clone()).collect())
+            Arc::clone(&portable.model_context)
         } else if let Some(prepared_fork) = prepared_fork.as_ref() {
             Arc::clone(&prepared_fork.model_context)
         } else {
@@ -5661,7 +5661,7 @@ impl ThreadRequestProcessor {
             ..options
         };
         let new_thread = if let Some(portable) = portable.take() {
-            self.thread_manager.fork_thread_from_portable_history(fork_options, portable.lines).await
+            self.thread_manager.fork_thread_from_portable_history(fork_options, portable).await
         } else if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
                 .fork_prepared_thread(fork_options, prepared_fork)

@@ -194,6 +194,39 @@ impl LiveThread {
         Ok(live)
     }
 
+    pub async fn create_with_portable_replay(
+        thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+        mut replay: crate::portable_history::PortableHistoryReplay,
+        model_context: &[RolloutItem],
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
+        let suffix_count = model_context.len().checked_sub(1).ok_or_else(|| crate::portable_history::invalid("portable context has no header"))?;
+        let suffix_start = replay.record_count.checked_sub(suffix_count as u64)
+            .ok_or_else(|| crate::portable_history::invalid("portable context exceeds its replay"))?;
+        let live = guard.acquire(Self::create(thread_store, params)).await?;
+        let mut continuation = false;
+        while !replay.is_empty() {
+            let (next, mut lines) = replay.next_batch().await?;
+            replay = next;
+            for line in &mut lines {
+                if let Some(ordinal) = line.ordinal.filter(|ordinal| *ordinal >= suffix_start) {
+                    // Startup assigns any missing response IDs in the active
+                    // context. Persist those same items, retaining timestamps.
+                    line.item = model_context[(ordinal - suffix_start) as usize + 1].clone();
+                }
+            }
+            let items = lines.iter().map(|line| line.item.clone()).collect::<Vec<_>>();
+            live.thread_store.append_portable_history_batch(live.thread_id, lines, continuation).await?;
+            // Accumulate derived metadata without emitting appends between
+            // prefix batches. persist() flushes it once the replay is complete.
+            let _ = live.metadata_sync.lock().await.observe_appended_items(&items);
+            continuation = true;
+        }
+        live.persist(PersistContext::Standard).await?;
+        Ok(live)
+    }
+
     /// Reopens persistence and returns the replay history selected under writer ownership.
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,

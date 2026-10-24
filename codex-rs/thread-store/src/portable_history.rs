@@ -10,6 +10,7 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_app_server_protocol::PORTABLE_HISTORY_MAX_BYTES;
 use codex_app_server_protocol::PORTABLE_HISTORY_MAX_LINE_BYTES;
@@ -30,7 +31,6 @@ use crate::ThreadStoreResult;
 
 pub const FORMAT: &str = "dev.harness.portableHistory";
 const MAX_HEADER_BYTES: u64 = 1024 * 1024;
-const MAX_RECORDS: u64 = 2_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -83,6 +83,40 @@ pub struct ImportedPortableHistory {
     pub lines: Vec<RolloutLine>,
 }
 
+pub struct ImportedPortableReplay {
+    pub manifest: PortableHistoryManifest,
+    pub model_context: Arc<Vec<RolloutItem>>,
+    pub replay: PortableHistoryReplay,
+}
+
+/// Validated anonymous snapshot, read once in bounded batches during startup.
+pub struct PortableHistoryReplay {
+    reader: BufReader<File>,
+    remaining: u64,
+    pub record_count: u64,
+}
+
+impl PortableHistoryReplay {
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+
+    pub async fn next_batch(mut self) -> ThreadStoreResult<(Self, Vec<RolloutLine>)> {
+        tokio::task::spawn_blocking(move || {
+            let mut lines = Vec::new();
+            let mut byte_count = 0;
+            while self.remaining > 0 && lines.len() < 1024 && byte_count < 2 * 1024 * 1024 {
+                let bytes = read_line(&mut self.reader, PORTABLE_HISTORY_MAX_LINE_BYTES)?;
+                if bytes.is_empty() { return Err(invalid("validated portable snapshot was truncated")); }
+                byte_count += bytes.len();
+                lines.push(codex_rollout::decode_rollout_line(serde_json::from_slice(&bytes).map_err(io_error)?).map_err(io_error)?);
+                self.remaining -= 1;
+            }
+            Ok((self, lines))
+        }).await.map_err(io_error)?
+    }
+}
+
 /// Read and hash one opened file into an anonymous snapshot before parsing it. Concurrent changes
 /// to the caller's pathname cannot switch the validated input underneath fork startup.
 pub async fn read_import(
@@ -91,9 +125,27 @@ pub async fn read_import(
     sha256: String,
     source_thread_id: ThreadId,
 ) -> ThreadStoreResult<ImportedPortableHistory> {
+    let imported = read_import_replay(path, byte_count, sha256, source_thread_id, std::env::temp_dir()).await?;
+    let mut replay = imported.replay;
+    let mut lines = Vec::new();
+    while !replay.is_empty() {
+        let (next, batch) = replay.next_batch().await?;
+        replay = next;
+        lines.extend(batch);
+    }
+    Ok(ImportedPortableHistory { manifest: imported.manifest, lines })
+}
+
+pub async fn read_import_replay(
+    path: PathBuf,
+    byte_count: u64,
+    sha256: String,
+    source_thread_id: ThreadId,
+    staging_directory: PathBuf,
+) -> ThreadStoreResult<ImportedPortableReplay> {
     let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
     let result = tokio::task::spawn_blocking(move || {
-        read_import_blocking(&path, byte_count, &sha256, source_thread_id, || stop.is_closed())
+        read_import_blocking(&path, byte_count, &sha256, source_thread_id, &staging_directory, || stop.is_closed())
     })
     .await
     .map_err(|error| invalid(format!("portable history reader failed: {error}")))?;
@@ -106,8 +158,9 @@ fn read_import_blocking(
     byte_count: u64,
     sha256: &str,
     source_thread_id: ThreadId,
+    staging_directory: &Path,
     is_cancelled: impl Fn() -> bool,
-) -> ThreadStoreResult<ImportedPortableHistory> {
+) -> ThreadStoreResult<ImportedPortableReplay> {
     if !path.is_absolute() || byte_count == 0 || byte_count > PORTABLE_HISTORY_MAX_BYTES {
         return Err(invalid("invalid portable history path/byte count"));
     }
@@ -119,7 +172,8 @@ fn read_import_blocking(
     if !metadata.is_file() || metadata.len() != byte_count {
         return Err(invalid("portable history size changed or input is not a regular file"));
     }
-    let mut snapshot = tempfile::tempfile().map_err(io_error)?;
+    prepare_staging_directory(staging_directory)?;
+    let mut snapshot = tempfile::tempfile_in(staging_directory).map_err(io_error)?;
     let mut digest = Sha256::new();
     let mut remaining = byte_count;
     let mut buffer = [0_u8; 64 * 1024];
@@ -144,10 +198,13 @@ fn read_import_blocking(
     let header = read_line(&mut reader, MAX_HEADER_BYTES)?;
     let manifest: PortableHistoryManifest = serde_json::from_slice(&header).map_err(io_error)?;
     validate_manifest(&manifest, source_thread_id)?;
-    let mut lines = Vec::new();
+    let records_start = reader.stream_position().map_err(io_error)?;
+    let mut record_count = 0_u64;
+    let mut session_meta = None;
     let mut terminal = TerminalBoundary::default();
     loop {
         cancelled(&is_cancelled)?;
+        let record_start = reader.stream_position().map_err(io_error)?;
         let bytes = read_line(&mut reader, PORTABLE_HISTORY_MAX_LINE_BYTES)?;
         if bytes.is_empty() {
             return Err(invalid("portable history footer is missing"));
@@ -155,7 +212,7 @@ fn read_import_blocking(
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io_error)?;
         if value.get("portableHistoryRecordCount").is_some() {
             let footer: Footer = serde_json::from_value(value).map_err(io_error)?;
-            if footer.portable_history_record_count != lines.len() as u64 || lines.is_empty() {
+            if footer.portable_history_record_count != record_count || record_count == 0 {
                 return Err(invalid("portable history record count mismatch"));
             }
             if !read_line(&mut reader, 1)?.is_empty() {
@@ -165,19 +222,35 @@ fn read_import_blocking(
             if footer.terminal_turn_id != terminal.last_terminal_turn_id {
                 return Err(invalid("portable history terminal boundary mismatch"));
             }
-            return Ok(ImportedPortableHistory { manifest, lines });
-        }
-        if lines.len() as u64 >= MAX_RECORDS {
-            return Err(invalid("portable history exceeds the record limit"));
+            let mut snapshot = reader.into_inner();
+            // Use precisely the same compaction-aware startup scan as native
+            // paginated resumes. The complete older transcript stays on disk.
+            let mut scan = codex_rollout::ModelContextScan::default();
+            {
+                let mut scanner = codex_rollout::ReverseJsonlScanner::new_at(&mut snapshot, record_start).map_err(io_error)?;
+                while let Some(outcome) = scanner.scan_next_rollout_line().map_err(io_error)? {
+                    cancelled(&is_cancelled)?;
+                    let codex_rollout::ScanOutcome::Parsed(line) = outcome else {
+                        return Err(invalid("validated portable snapshot contains an unreadable record"));
+                    };
+                    if matches!(&line.item, RolloutItem::SessionMeta(_)) { break; }
+                    if scan.push(line.item) == codex_rollout::ModelContextScanProgress::Complete { break; }
+                }
+            }
+            let mut model_context = scan.finish();
+            model_context.insert(0, RolloutItem::SessionMeta(session_meta.ok_or_else(|| invalid("portable history has no canonical header"))?));
+            snapshot.seek(SeekFrom::Start(records_start)).map_err(io_error)?;
+            return Ok(ImportedPortableReplay { manifest, model_context: Arc::new(model_context),
+                replay: PortableHistoryReplay { reader: BufReader::new(snapshot), remaining: record_count, record_count } });
         }
         let line = codex_rollout::decode_rollout_line(value.clone()).map_err(io_error)?;
         ensure_lossless(&value, &serde_json::to_value(&line).map_err(io_error)?)?;
-        if line.ordinal != Some(lines.len() as u64) {
+        if line.ordinal != Some(record_count) {
             return Err(invalid("portable history ordinals are not contiguous"));
         }
         chrono::DateTime::parse_from_rfc3339(&line.timestamp).map_err(io_error)?;
         match &line.item {
-            RolloutItem::SessionMeta(meta) if lines.is_empty() => {
+            RolloutItem::SessionMeta(meta) if record_count == 0 => {
                 if meta.meta.id != source_thread_id
                     || meta.meta.history_mode != ThreadHistoryMode::Paginated
                     || meta.meta.history_base.is_some()
@@ -187,14 +260,15 @@ fn read_import_blocking(
                 {
                     return Err(invalid("portable history has an invalid canonical root header"));
                 }
+                session_meta = Some(meta.clone());
             }
             RolloutItem::SessionMeta(_) => {
                 return Err(invalid("portable history contains an unflattened session header"));
             }
-            _ if lines.is_empty() => return Err(invalid("portable history has no canonical header")),
+            _ if record_count == 0 => return Err(invalid("portable history has no canonical header")),
             _ => terminal.observe(&line.item)?,
         }
-        lines.push(line);
+        record_count = record_count.checked_add(1).ok_or_else(|| invalid("portable history record count overflow"))?;
     }
 }
 
@@ -320,6 +394,17 @@ pub(crate) fn read_line(reader: &mut impl BufRead, limit: u64) -> ThreadStoreRes
     Ok(bytes)
 }
 
+fn prepare_staging_directory(path: &Path) -> ThreadStoreResult<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(io_error)
+}
+
 pub(crate) struct ArtifactWriter {
     pub(crate) file: tempfile::NamedTempFile,
     digest: Sha256,
@@ -328,10 +413,11 @@ pub(crate) struct ArtifactWriter {
 }
 
 impl ArtifactWriter {
-    pub(crate) fn new() -> ThreadStoreResult<Self> {
+    pub(crate) fn new(staging_directory: &Path) -> ThreadStoreResult<Self> {
+        prepare_staging_directory(staging_directory)?;
         Ok(Self {
             file: tempfile::Builder::new().prefix("harness-portable-history-").suffix(".jsonl")
-                .tempfile().map_err(io_error)?,
+                .tempfile_in(staging_directory).map_err(io_error)?,
             digest: Sha256::new(), byte_count: 0, record_count: 0,
         })
     }
@@ -351,12 +437,9 @@ impl ArtifactWriter {
     }
 
     pub(crate) fn write_record(&mut self, mut line: RolloutLine) -> ThreadStoreResult<()> {
-        if self.record_count >= MAX_RECORDS {
-            return Err(invalid("portable history exceeds the record limit"));
-        }
         line.ordinal = Some(self.record_count);
         self.write_json(&line)?;
-        self.record_count += 1;
+        self.record_count = self.record_count.checked_add(1).ok_or_else(|| invalid("portable history record count overflow"))?;
         Ok(())
     }
 

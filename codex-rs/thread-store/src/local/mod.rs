@@ -640,6 +640,15 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::append_portable_history(self, thread_id, lines).await })
     }
 
+    fn append_portable_history_batch(
+        &self,
+        thread_id: ThreadId,
+        lines: Vec<codex_rollout::RolloutLine>,
+        continuation: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { live_writer::append_portable_history_batch(self, thread_id, lines, continuation).await })
+    }
+
     fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { revert_thread::revert(self, params).await })
     }

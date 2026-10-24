@@ -1,5 +1,6 @@
 use std::io::BufReader;
 use std::io::Read;
+use std::path::Path;
 
 use codex_app_server_protocol::PORTABLE_HISTORY_MAX_LINE_BYTES;
 use codex_app_server_protocol::PORTABLE_HISTORY_ROLLOUT_SCHEMA;
@@ -87,11 +88,12 @@ pub(super) async fn export(
     };
     validate_manifest(&manifest, thread_id)?;
     let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let staging_directory = store.config.codex_home.join("tmp").join("portable-history");
     let result = tokio::task::spawn_blocking(move || {
         // Cancellation of the waiting RPC still leaves source ownership with this worker until
         // its bounded reader observes cancellation and deletes its own unfinished temporary file.
         let _source_reservation = prepared;
-        write_export(manifest, header, lineage, || stop.is_closed())
+        write_export(manifest, header, lineage, &staging_directory, || stop.is_closed())
     }).await.map_err(io_error)?;
     drop(keep_running);
     result
@@ -101,6 +103,7 @@ fn write_export(
     manifest: PortableHistoryManifest,
     mut header: Box<codex_protocol::protocol::SessionMetaLine>,
     lineage: Option<RolloutLineage>,
+    staging_directory: &Path,
     is_cancelled: impl Fn() -> bool,
 ) -> ThreadStoreResult<PortableHistoryArtifact> {
     cancelled(&is_cancelled)?;
@@ -111,7 +114,7 @@ fn write_export(
     // remains. Retain immediate-source runtime metadata/version rather than an ancestor's header.
     header.meta.history_base = None;
     chrono::DateTime::parse_from_rfc3339(&header.meta.timestamp).map_err(io_error)?;
-    let mut writer = ArtifactWriter::new()?;
+    let mut writer = ArtifactWriter::new(staging_directory)?;
     writer.write_json(&manifest)?;
     writer.write_record(RolloutLine {
         timestamp: header.meta.timestamp.clone(), ordinal: Some(0),

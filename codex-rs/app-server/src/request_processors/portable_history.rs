@@ -173,8 +173,9 @@ impl ThreadRequestProcessor {
         }
         let _import_permit = Arc::clone(&self.portable_history_exports.imports).try_acquire_owned()
             .map_err(|_| invalid_request("another portable history import is already being prepared"))?;
-        let portable = codex_thread_store::portable_history::read_import(
+        let portable = codex_thread_store::portable_history::read_import_replay(
             params.path.into_path_buf(), params.byte_count, params.sha256.clone(), source_thread_id,
+            self.config.codex_home.join("tmp").join("portable-history").to_path_buf(),
         ).await.map_err(|error| invalid_request(format!("invalid portable history: {error}")))?;
         // Everything above is read-only validation. Once fork startup is entered, an unclassified
         // failure/cancellation may already have persisted a new identity. Never relabel it retryable.

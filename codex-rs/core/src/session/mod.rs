@@ -448,7 +448,7 @@ pub(crate) enum ForkPersistence {
     /// Complete raw copied replay from another host, with original record timestamps.
     Portable {
         // Consumed during startup acquisition; the live session retains only the prefix count.
-        lines: Option<Arc<Vec<codex_rollout::RolloutLine>>>,
+        replay: Option<codex_thread_store::portable_history::PortableHistoryReplay>,
         inherited_item_count: usize,
     },
     /// The spawn caller owns the durability barrier before acknowledging the child.
