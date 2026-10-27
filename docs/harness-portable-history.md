@@ -5,6 +5,16 @@ It completes the paginated-history transfer path used by the Flutter client.
 The desktop Git snapshot/worktree transfer remains owned by the client. This is
 an additive local RPC contract, not an OpenAI HTTP API or a replacement agent loop.
 
+The client also transfers uncommitted submodule additions/removals recursively.
+Git objects use the configured Git remotes; file patches and module checkout
+operations use the existing `process/spawn` binary streams. Structural gitlink
+changes and their staged `.gitmodules` delta remain in the receiving index;
+ordinary file edits arrive unstaged. Uninitialized modules can retain index-only
+changes without materializing files at the receiver. Removed checkouts and Move backups remain
+recoverable in the owning repositories. This Git topology handling is entirely
+client-owned and needs no portable-history schema or app-server RPC change.
+See `client/docs/machine-handoff-git-sync.md` in the parent repository.
+
 Initialize with `experimentalApi: true` and an extension offer containing
 `version: 1` and the exact `PORTABLE_HISTORY_ROLLOUT_SCHEMA`. Compatible local
 stores return `portableHistory` with the schema, byte limits and
