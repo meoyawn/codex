@@ -41,6 +41,7 @@ pub struct EffectiveMcpServer {
     agent_plugin: bool,
     requires_read_only_mcp_tools: bool,
     in_process: Option<InProcessServer>,
+    shared_stdio_scope: Option<codex_rmcp_client::McpStdioScope>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,7 @@ impl EffectiveMcpServer {
             agent_plugin: false,
             requires_read_only_mcp_tools: false,
             in_process: None,
+            shared_stdio_scope: None,
         }
     }
 
@@ -91,6 +93,15 @@ impl EffectiveMcpServer {
 
     pub fn config(&self) -> &McpServerConfig {
         &self.config
+    }
+
+    pub(crate) fn with_shared_stdio_scope(mut self, scope: Option<codex_rmcp_client::McpStdioScope>) -> Self {
+        self.shared_stdio_scope = scope;
+        self
+    }
+
+    pub(crate) fn shared_stdio_scope(&self) -> Option<&codex_rmcp_client::McpStdioScope> {
+        self.shared_stdio_scope.as_ref()
     }
 
     /// Application-owned MCP uses the same manager/policy/catalog as external
@@ -152,6 +163,7 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
     in_process_identity: Option<String>,
+    shared_stdio_scope: Option<codex_rmcp_client::McpStdioScope>,
     auth: McpServerAuth,
     pub(crate) credential_policy: McpCredentialPolicy,
     transport: McpServerTransportConfig,
@@ -264,7 +276,7 @@ impl McpServerConnectionIdentity {
                         ..
                     }
             ))
-        .then(|| runtime_context.local_process_cwd());
+        .then(|| server.shared_stdio_scope().map(|scope| scope.cwd.clone()).unwrap_or_else(|| runtime_context.local_process_cwd()));
         let referenced_environment_variables = match server.credential_policy() {
             McpCredentialPolicy::HostFallbackAllowed => referenced_environment_variables(config),
             McpCredentialPolicy::ExecutorOnly => Vec::new(),
@@ -280,6 +292,7 @@ impl McpServerConnectionIdentity {
         Self {
             auth: config.auth.clone(),
             in_process_identity: server.in_process.as_ref().map(|server| server.identity.clone()),
+            shared_stdio_scope: server.shared_stdio_scope.clone(),
             credential_policy: server.credential_policy(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
@@ -320,6 +333,7 @@ impl McpServerConnectionIdentity {
         };
         self.auth == other.auth
             && self.in_process_identity == other.in_process_identity
+            && self.shared_stdio_scope == other.shared_stdio_scope
             && self.credential_policy == other.credential_policy
             && self.transport == other.transport
             && self.environment_id == other.environment_id

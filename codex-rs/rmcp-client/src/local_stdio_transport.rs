@@ -7,15 +7,11 @@ use std::io;
 use std::time::Duration;
 
 use codex_utils_pty::Command;
-use futures::FutureExt;
 use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
-use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::process::ChildStderr;
-use tokio::process::ChildStdin;
-use tokio::process::ChildStdout;
 
 use crate::bounded_stdio_transport::BoundedStdioTransport;
 use crate::protocol_mode::McpProtocolMode;
@@ -23,14 +19,7 @@ use codex_utils_pty::Child;
 
 pub(super) struct LocalStdioTransport {
     child: Box<Child>,
-    transport: StdioTransport,
-}
-
-enum StdioTransport {
-    /// Preserve rmcp's existing framing for servers using the initialize handshake.
-    Legacy(AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>),
-    /// Bound frames and skip messages unknown to the client during 2026-07-28 discovery.
-    V20260728(BoundedStdioTransport),
+    transport: BoundedStdioTransport,
 }
 
 impl LocalStdioTransport {
@@ -49,12 +38,9 @@ impl LocalStdioTransport {
             .take()
             .ok_or_else(|| io::Error::other("MCP server stdout was not piped"))?;
         let stderr = child.stderr.take();
-        let transport = match protocol_mode {
-            McpProtocolMode::Legacy => StdioTransport::Legacy(AsyncRwTransport::new(stdout, stdin)),
-            McpProtocolMode::V20260728 => {
-                StdioTransport::V20260728(BoundedStdioTransport::new(stdin, stdout, program_name))
-            }
-        };
+        // Dropping an oversized response without closing the connection leaves
+        // its request pending and blocks the entire shared legacy request queue.
+        let transport = BoundedStdioTransport::new(stdin, stdout, program_name, protocol_mode);
         Ok((
             Self {
                 child: Box::new(child),
@@ -76,24 +62,15 @@ impl Transport<RoleClient> for LocalStdioTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = io::Result<()>> + Send + 'static {
-        match &mut self.transport {
-            StdioTransport::Legacy(transport) => transport.send(item).boxed(),
-            StdioTransport::V20260728(transport) => transport.send(item).boxed(),
-        }
+        self.transport.send(item)
     }
 
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        match &mut self.transport {
-            StdioTransport::Legacy(transport) => transport.receive().boxed(),
-            StdioTransport::V20260728(transport) => transport.receive().boxed(),
-        }
+        self.transport.receive()
     }
 
     async fn close(&mut self) -> io::Result<()> {
-        match &mut self.transport {
-            StdioTransport::Legacy(transport) => transport.close().await?,
-            StdioTransport::V20260728(transport) => transport.close().await?,
-        }
+        self.transport.close().await?;
         match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
             Ok(status) => status.map(|_| ()),
             Err(_) => self.child.kill().await,

@@ -144,10 +144,16 @@ pub struct McpServerRegistration {
     config: McpServerConfig,
     credential_policy: McpCredentialPolicy,
     protocol_mode: Option<McpProtocolMode>,
+    shared_stdio_scope: Option<codex_rmcp_client::McpStdioScope>,
     precedence: RegistrationPrecedence,
 }
 
 impl McpServerRegistration {
+    pub fn with_shared_stdio_scope(mut self, scope: Option<codex_rmcp_client::McpStdioScope>) -> Self {
+        self.shared_stdio_scope = scope;
+        self
+    }
+
     /// Registers host-owned configuration, which may resolve credentials on the host.
     pub fn from_config(name: String, config: McpServerConfig) -> Self {
         Self::new(
@@ -284,6 +290,7 @@ impl McpServerRegistration {
             config,
             credential_policy,
             protocol_mode: None,
+            shared_stdio_scope: None,
             precedence,
         }
     }
@@ -554,6 +561,7 @@ impl McpCatalogBuilder {
                             config: registration.config,
                             credential_policy: registration.credential_policy,
                             protocol_mode: registration.protocol_mode,
+                            shared_stdio_scope: registration.shared_stdio_scope,
                         },
                     ))
                 }
@@ -578,9 +586,14 @@ pub struct ResolvedMcpServer {
     config: McpServerConfig,
     credential_policy: McpCredentialPolicy,
     protocol_mode: Option<McpProtocolMode>,
+    shared_stdio_scope: Option<codex_rmcp_client::McpStdioScope>,
 }
 
 impl ResolvedMcpServer {
+    pub(crate) fn shared_stdio_scope(&self) -> Option<codex_rmcp_client::McpStdioScope> {
+        self.shared_stdio_scope.clone()
+    }
+
     pub fn source(&self) -> &McpServerSource {
         &self.source
     }

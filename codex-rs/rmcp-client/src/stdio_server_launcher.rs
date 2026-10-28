@@ -2,8 +2,8 @@
 //!
 //! This module owns the "where does the server process run?" decision:
 //!
-//! - [`LocalStdioServerLauncher`] starts the configured command as a child of
-//!   the orchestrator process.
+//! - [`LocalStdioServerLauncher`] starts a local child, or acquires its shared
+//!   process owner when the declaration has a configuration scope.
 //! - [`ExecutorStdioServerLauncher`] starts the configured command through the
 //!   executor process API.
 //!
@@ -82,10 +82,15 @@ pub trait StdioServerLauncher: private::Sealed + Send + Sync {
         &self,
         command: StdioServerCommand,
     ) -> BoxFuture<'static, io::Result<StdioServerTransport>>;
+
+    /// Reacquire an existing declaration without replacing a newer configuration.
+    fn reconnect(&self, command: StdioServerCommand) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
+        self.launch(command)
+    }
 }
 
 /// Command-line process shape shared by stdio server launchers.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct StdioServerCommand {
     program: OsString,
     args: Vec<OsString>,
@@ -108,6 +113,7 @@ pub struct StdioServerTransport {
 enum StdioServerTransportInner {
     Local(LocalStdioTransport),
     Executor(ExecutorProcessTransport),
+    Shared(rmcp::transport::async_rw::AsyncRwTransport<RoleClient, tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>>),
 }
 
 impl Transport<RoleClient> for StdioServerTransport {
@@ -123,6 +129,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         match &mut self.inner {
             StdioServerTransportInner::Local(transport) => transport.send(item).boxed(),
             StdioServerTransportInner::Executor(transport) => transport.send(item).boxed(),
+            StdioServerTransportInner::Shared(transport) => transport.send(item).boxed(),
         }
     }
 
@@ -133,6 +140,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         match &mut self.inner {
             StdioServerTransportInner::Local(transport) => transport.receive().boxed(),
             StdioServerTransportInner::Executor(transport) => transport.receive().boxed(),
+            StdioServerTransportInner::Shared(transport) => transport.receive().boxed(),
         }
     }
 
@@ -141,17 +149,37 @@ impl Transport<RoleClient> for StdioServerTransport {
         match &mut self.inner {
             StdioServerTransportInner::Local(transport) => transport.close().await,
             StdioServerTransportInner::Executor(transport) => transport.close().await,
+            StdioServerTransportInner::Shared(transport) => transport.close().await,
         }
     }
 }
 
 impl StdioServerTransport {
+    pub(super) fn shared(stream: tokio::io::DuplexStream, max_line_bytes: usize) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            inner: StdioServerTransportInner::Shared(rmcp::transport::async_rw::AsyncRwTransport::new(reader, writer).with_max_line_length(max_line_bytes + 1)),
+            process: StdioServerProcessHandle {
+                inner: Arc::new(StdioServerProcessHandleInner {
+                    program_name: "shared MCP connection".to_string(),
+                    kind: StdioServerProcessKind::Shared,
+                    terminated: AtomicBool::new(false),
+                    stderr_reader: None,
+                }),
+            },
+        }
+    }
+
     pub(crate) fn process_handle(&self) -> StdioServerProcessHandle {
         self.process.clone()
     }
 }
 
 impl StdioServerCommand {
+    pub(super) fn protocol_mode(&self) -> McpProtocolMode {
+        self.protocol_mode
+    }
+
     /// Build the stdio process parameters before choosing where the process
     /// runs.
     pub(super) fn new(
@@ -183,6 +211,8 @@ impl StdioServerCommand {
 #[derive(Clone)]
 pub struct LocalStdioServerLauncher {
     fallback_cwd: PathBuf,
+    shared_scope: Option<crate::shared_stdio::McpStdioScope>,
+    request_timeout: Duration,
 }
 
 impl LocalStdioServerLauncher {
@@ -191,7 +221,15 @@ impl LocalStdioServerLauncher {
     /// `fallback_cwd` is used when the MCP server config omits `cwd`, so
     /// relative commands resolve from the caller's runtime working directory.
     pub fn new(fallback_cwd: PathBuf) -> Self {
-        Self { fallback_cwd }
+        Self { fallback_cwd, shared_scope: None, request_timeout: Duration::from_secs(300) }
+    }
+
+    /// Config declarations share one process-local owner, independent of threads/projects.
+    pub fn with_shared_scope(mut self, scope: crate::shared_stdio::McpStdioScope, request_timeout: Duration) -> Self {
+        self.fallback_cwd = scope.cwd.clone();
+        self.shared_scope = Some(scope);
+        self.request_timeout = request_timeout;
+        self
     }
 }
 
@@ -201,7 +239,12 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
         command: StdioServerCommand,
     ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
         let fallback_cwd = self.fallback_cwd.clone();
+        let shared_scope = self.shared_scope.clone();
+        let request_timeout = self.request_timeout;
         async move {
+            if let Some(scope) = shared_scope {
+                return crate::shared_stdio::connect(scope, command, request_timeout, false).await;
+            }
             // Keep synchronous program resolution and process creation from blocking the
             // caller's startup deadline.
             tokio::task::spawn_blocking(move || Self::launch_server(command, fallback_cwd))
@@ -209,6 +252,12 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
                 .map_err(io::Error::other)?
         }
         .boxed()
+    }
+
+    fn reconnect(&self, command: StdioServerCommand) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
+        let Some(scope) = self.shared_scope.clone() else { return self.launch(command); };
+        let request_timeout = self.request_timeout;
+        async move { crate::shared_stdio::connect(scope, command, request_timeout, true).await }.boxed()
     }
 }
 
@@ -251,6 +300,7 @@ struct StdioServerProcessHandleInner {
 enum StdioServerProcessKind {
     Local(Option<LocalProcessTerminator>),
     Executor(Arc<dyn ExecProcess>),
+    Shared,
 }
 
 mod private {
@@ -260,7 +310,7 @@ mod private {
 impl private::Sealed for LocalStdioServerLauncher {}
 
 impl LocalStdioServerLauncher {
-    fn launch_server(
+    pub(super) fn launch_server(
         command: StdioServerCommand,
         fallback_cwd: PathBuf,
     ) -> io::Result<StdioServerTransport> {
@@ -455,6 +505,10 @@ impl LocalProcessTerminator {
 }
 
 impl StdioServerProcessHandle {
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(self.inner.kind, StdioServerProcessKind::Shared)
+    }
+
     fn local(
         program_name: String,
         terminator: Option<LocalProcessTerminator>,
@@ -492,6 +546,7 @@ impl StdioServerProcessHandle {
                 Ok(())
             }
             StdioServerProcessKind::Local(None) => Ok(()),
+            StdioServerProcessKind::Shared => Ok(()),
             StdioServerProcessKind::Executor(process) => match process.terminate().await {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -518,6 +573,7 @@ impl Drop for StdioServerProcessHandleInner {
                 terminator.terminate();
             }
             StdioServerProcessKind::Local(None) => {}
+            StdioServerProcessKind::Shared => {}
             StdioServerProcessKind::Executor(process) => {
                 let process = Arc::clone(process);
                 let program_name = self.program_name.clone();

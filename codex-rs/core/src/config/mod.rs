@@ -1818,6 +1818,37 @@ impl Config {
         filter_mcp_servers_by_requirements(mcp_servers, empty_mcp_allowlist);
     }
 
+    /// The layer declaring the transport owns its process. Tool-policy overlays
+    /// do not turn a global server into a project server.
+    fn mcp_stdio_scope(&self, name: &str, server: &McpServerConfig) -> Option<codex_rmcp_client::McpStdioScope> {
+        if !server.is_local_environment()
+            || !matches!(server.transport, codex_config::McpServerTransportConfig::Stdio { .. })
+            || matches!(server.auth, codex_config::McpServerAuth::EmaAuth)
+        {
+            return None;
+        }
+        let layer = self.config_layer_stack.layers_high_to_low().find(|layer| {
+            layer.config.get("mcp_servers").and_then(|servers| servers.get(name))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| ["command", "args", "env", "env_vars", "cwd"].iter().any(|key| table.contains_key(*key)))
+        })?;
+        let (file, cwd, profile) = match &layer.name {
+            ConfigLayerSource::User { file, profile } => (
+                file.to_path_buf(), file.parent()?.to_path_buf(), profile.clone(),
+            ),
+            ConfigLayerSource::System { file } | ConfigLayerSource::PackagedDefaults { file } => (
+                file.to_path_buf(), file.parent()?.to_path_buf(), None,
+            ),
+            ConfigLayerSource::Project { dot_codex_folder } => (
+                dot_codex_folder.join("config.toml").to_path_buf(),
+                dot_codex_folder.parent()?.to_path_buf(), None,
+            ),
+            // Session overrides and provider-owned transports retain their ownership.
+            _ => return None,
+        };
+        Some(codex_rmcp_client::McpStdioScope::new(file, name.to_owned(), profile, cwd))
+    }
+
     pub async fn to_mcp_config(
         &self,
         plugins_manager: &codex_core_plugins::PluginsManager,
@@ -1886,7 +1917,7 @@ impl Config {
             catalog.register(McpServerRegistration::from_config(
                 name.clone(),
                 server.clone(),
-            ));
+            ).with_shared_stdio_scope(self.mcp_stdio_scope(name, server)));
         }
 
         McpConfig {

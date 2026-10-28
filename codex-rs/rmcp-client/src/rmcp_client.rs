@@ -1031,6 +1031,22 @@ impl RmcpClient {
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
+        let service = {
+            let guard = self.state.lock().await;
+            match &*guard {
+                ClientState::Ready { service, .. } => Arc::clone(service),
+                ClientState::Connecting { .. } => return Err(anyhow!("MCP client not initialized")),
+                ClientState::Closed => return Err(anyhow!("MCP client is shut down")),
+            }
+        };
+        if !self.stdio_process.as_ref().is_some_and(StdioServerProcessHandle::is_shared)
+            || (!service.is_closed() && !service.peer().is_transport_closed())
+        {
+            return Ok(service);
+        }
+        // Published tool bindings retain this client. Reconnect before sending
+        // the next request; never replay a request whose outcome is unknown.
+        self.reinitialize_after_session_expiry(&service).await?;
         let guard = self.state.lock().await;
         match &*guard {
             ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
@@ -1603,7 +1619,16 @@ impl RmcpClient {
             .await
             .clone()
             .ok_or_else(|| anyhow!("MCP client cannot recover before initialize succeeds"))?;
-        let pending_transport = Self::create_pending_transport(&self.transport_recipe).await?;
+        let pending_transport = match &self.transport_recipe {
+            TransportRecipe::Stdio { command, launcher }
+                if self.stdio_process.as_ref().is_some_and(StdioServerProcessHandle::is_shared) =>
+            {
+                PendingTransport::Stdio {
+                    transport: Box::new(launcher.reconnect(command.clone()).await?),
+                }
+            }
+            _ => Self::create_pending_transport(&self.transport_recipe).await?,
+        };
         let (service, oauth_runtime) = self
             .connect_pending_transport_with_initialize_retries(
                 pending_transport,
