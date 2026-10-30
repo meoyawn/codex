@@ -263,6 +263,9 @@ impl StepSettings {
                 /*developer_instructions*/ None,
             )
         });
+        if next.collaboration_mode.model() != self.collaboration_mode.model() {
+            return Err(ConstraintError::PromptCacheInvalidation { field_name: "model" });
+        }
         if let Some(summary) = update.reasoning_summary {
             next.reasoning_summary = Some(summary);
         }

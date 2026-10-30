@@ -5,6 +5,8 @@ mod daemon_continuation;
 mod daemon_snapshot;
 
 mod workspace_switching;
+#[path = "portable_history.rs"]
+mod portable_history;
 
 use super::persisted_resume_settings::PersistedResumeSettings;
 use super::persisted_resume_settings::latest_owned_thread_settings;
@@ -83,6 +85,28 @@ async fn remove_pending_thread_metadata(
     };
     if let Err(error) = thread_store.remove_pending_thread_metadata(thread_id).await {
         warn!("failed to remove staged thread metadata for {thread_id}: {error}");
+    }
+}
+
+struct ForkSource {
+    thread_id: ThreadId,
+    history_mode: ThreadHistoryMode,
+    name: Option<String>,
+    cwd: PathBuf,
+    preview: String,
+    rollout_path: Option<PathBuf>,
+    project_id: Option<String>,
+    daybreak_enabled: Option<bool>,
+}
+
+impl From<StoredThread> for ForkSource {
+    fn from(source: StoredThread) -> Self {
+        Self {
+            thread_id: source.thread_id, history_mode: source.history_mode,
+            name: source.name, cwd: source.cwd, preview: source.preview,
+            rollout_path: source.rollout_path, project_id: source.project_id,
+            daybreak_enabled: source.daybreak_enabled,
+        }
     }
 }
 
@@ -247,25 +271,21 @@ fn merge_persisted_resume_metadata(
     typesafe_overrides: &mut ConfigOverrides,
     persisted_metadata: &ThreadMetadata,
 ) {
-    let has_model_override =
-        has_model_resume_override(request_overrides.as_ref(), typesafe_overrides);
-
-    // Model and reasoning overrides do not imply a provider change.
+    // Restore each omitted field independently. An effort-only override must
+    // not accidentally select the host's current default model on cold resume.
+    if typesafe_overrides.model.is_none()
+        && !request_overrides.as_ref().is_some_and(|values| values.contains_key("model"))
+    {
+        typesafe_overrides.model = persisted_metadata.model.clone();
+    }
     if typesafe_overrides.model_provider.is_none()
-        && !request_overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key("model_provider"))
+        && !request_overrides.as_ref().is_some_and(|values| values.contains_key("model_provider"))
     {
         typesafe_overrides.model_provider = Some(persisted_metadata.model_provider.clone());
     }
-
-    if has_model_override {
-        return;
-    }
-
-    typesafe_overrides.model = persisted_metadata.model.clone();
-
-    if let Some(reasoning_effort) = persisted_metadata.reasoning_effort.as_ref() {
+    if !request_overrides.as_ref().is_some_and(|values| values.contains_key("model_reasoning_effort"))
+        && let Some(reasoning_effort) = persisted_metadata.reasoning_effort.as_ref()
+    {
         request_overrides.get_or_insert_with(HashMap::new).insert(
             "model_reasoning_effort".to_string(),
             serde_json::Value::String(reasoning_effort.to_string()),
@@ -513,6 +533,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    portable_history_exports: Arc<portable_history::PortableHistoryExports>,
 }
 
 /// Whether resume attaches a client or restores a cold runtime during daemon startup.
@@ -574,6 +595,7 @@ impl ThreadRequestProcessor {
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            portable_history_exports: Arc::new(portable_history::PortableHistoryExports::default()),
         }
     }
 
@@ -647,6 +669,7 @@ impl ThreadRequestProcessor {
             app_server_client_name,
             app_server_client_version,
             client_mcp_extensions,
+            None,
         ))
         .await
         .map(|()| None)
@@ -3873,12 +3896,14 @@ impl ThreadRequestProcessor {
         connection_id: ConnectionId,
         capabilities: ConnectionCapabilities,
     ) {
+        self.portable_history_exports.connection_initialized(connection_id).await;
         self.thread_state_manager
             .connection_initialized(connection_id, capabilities)
             .await;
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.portable_history_exports.connection_closed(connection_id).await;
         let thread_ids = self
             .thread_state_manager
             .remove_connection(connection_id)
@@ -3924,6 +3949,9 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         prepared_config: &mut Option<PreparedResumeConfig>,
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
+        if let Some(tools) = params.dynamic_tools.as_ref() {
+            validate_dynamic_tools(tools).map_err(invalid_request)?;
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -3982,6 +4010,7 @@ impl ThreadRequestProcessor {
 
         let ThreadResumeParams {
             thread_id,
+            dynamic_tools,
             history,
             path,
             model,
@@ -4374,6 +4403,9 @@ impl ThreadRequestProcessor {
                     self.outgoing.send_error(request_id, err).await;
                     return Ok(ControlFlow::Break(()));
                 }
+                if let Some(tools) = dynamic_tools {
+                    codex_thread.upsert_dynamic_tools(tools).await;
+                }
                 let instruction_sources = codex_thread.legacy_instruction_sources().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
@@ -4754,6 +4786,9 @@ impl ThreadRequestProcessor {
                 .map_err(|err| config_load_error(&err))?;
             let redact_resume_payloads =
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());
+            if let Some(tools) = params.dynamic_tools.clone() {
+                existing_thread.upsert_dynamic_tools(tools).await;
+            }
             let include_turns = !params.exclude_turns;
             if paginated_resume && include_turns {
                 self.send_deprecation_notice(
@@ -5252,12 +5287,14 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
+        mut portable: Option<codex_thread_store::portable_history::ImportedPortableReplay>,
     ) -> Result<(), JSONRPCErrorError> {
         if params.experimental_disable_prediction_mcp && !params.experimental_prediction_mode {
             return Err(invalid_request(
                 "`experimentalDisablePredictionMcp` requires `experimentalPredictionMode: true`",
             ));
         }
+        let is_portable = portable.is_some();
         let has_config_overrides = params.model.is_some()
             || params.model_provider.is_some()
             || params.service_tier.is_some()
@@ -5331,18 +5368,23 @@ impl ThreadRequestProcessor {
                 "`experimentalPredictionMode` requires a thread id without a path or turn cutoff",
             ));
         }
-        let source_thread = self
-            .read_stored_thread_for_resume(
-                &thread_id,
-                path.as_ref(),
-                /*include_history*/ false,
-            )
-            .await?;
-        let loaded_parent = self
-            .thread_manager
-            .get_thread(source_thread.thread_id)
-            .await
-            .ok();
+        let source_thread = match portable.as_ref() {
+            Some(portable) => ForkSource {
+                thread_id: portable.manifest.source_thread_id,
+                history_mode: ThreadHistoryMode::Paginated,
+                name: portable.manifest.source_name.clone(), cwd: portable.manifest.source_cwd.clone(),
+                preview: portable.manifest.source_preview.clone(), rollout_path: None,
+                project_id: None, daybreak_enabled: None,
+            },
+            None => self.read_stored_thread_for_resume(
+                &thread_id, path.as_ref(), /*include_history*/ false,
+            ).await?.into(),
+        };
+        let loaded_parent = if is_portable {
+            None
+        } else {
+            self.thread_manager.get_thread(source_thread.thread_id).await.ok()
+        };
         let inherited_fork = if experimental_prediction_mode {
             // Keep inherited state and its preparation off the fork handler's stack.
             let (mut options, settings) = Box::pin(async {
@@ -5437,7 +5479,7 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let mut prepared_fork = if paginated_source {
+        let mut prepared_fork = if paginated_source && !is_portable {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
                     codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
@@ -5469,7 +5511,9 @@ impl ThreadRequestProcessor {
         } else {
             None
         };
-        let source_history_items = if let Some(prepared_fork) = prepared_fork.as_ref() {
+        let source_history_items = if let Some(portable) = portable.as_ref() {
+            Arc::clone(&portable.model_context)
+        } else if let Some(prepared_fork) = prepared_fork.as_ref() {
             Arc::clone(&prepared_fork.model_context)
         } else {
             let mut source_thread = self
@@ -5550,6 +5594,7 @@ impl ThreadRequestProcessor {
             None
         };
         let latest_context = if paginated_source
+            && !is_portable
             && needs_latest_settings
             && loaded_parent.is_none()
             && (last_turn_id.is_some() || before_turn_id.is_some())
@@ -5600,16 +5645,57 @@ impl ThreadRequestProcessor {
                 &mut typesafe_overrides,
             );
         }
+        let mut request_overrides = request_overrides;
+        // Resolve defaults from the actual fork boundary, including historical
+        // forks, before loading host defaults. Explicit mismatches are rejected
+        // by core startup for every caller, including subagents and portable forks.
+        let bounded_model_history = if prepared_fork.is_none() {
+            match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
+                (Some(turn_id), None) => Some(truncate_rollout_after_turn_id(source_history_items.as_ref().clone(), turn_id)
+                    .map_err(|err| core_thread_write_error("truncate thread for fork", err))?),
+                (None, Some(turn_id)) => Some(truncate_rollout_before_turn_id(source_history_items.as_ref().clone(), turn_id)
+                    .map_err(|err| core_thread_write_error("truncate thread for fork", err))?),
+                _ => None,
+            }
+        } else { None };
+        let inherited_model_settings = codex_history::latest_model_settings(
+            bounded_model_history.as_deref().unwrap_or(source_history_items.as_ref()),
+        );
+        let inherited_effort = if let Some((model, effort)) = inherited_model_settings {
+            if typesafe_overrides.model.is_none()
+                && !request_overrides.as_ref().is_some_and(|values| values.contains_key("model"))
+            {
+                typesafe_overrides.model = Some(model.to_string());
+            }
+            Some(effort.cloned())
+        } else if let Some(parent) = loaded_parent.as_ref() {
+            let settings = parent.config_snapshot().await;
+            if typesafe_overrides.model.is_none()
+                && !request_overrides.as_ref().is_some_and(|values| values.contains_key("model"))
+            {
+                typesafe_overrides.model = Some(settings.model);
+            }
+            Some(settings.reasoning_effort)
+        } else { None };
+        let restore_effort = !request_overrides.as_ref().is_some_and(|values| values.contains_key("model_reasoning_effort"));
+        if restore_effort && let Some(Some(effort)) = &inherited_effort {
+            request_overrides.get_or_insert_with(HashMap::new).insert(
+                "model_reasoning_effort".to_string(), serde_json::Value::String(effort.to_string()),
+            );
+        }
         let (inherited_options, inherited_settings) = inherited_fork.unzip();
         let options = if let Some(options) = inherited_options {
             *options
         } else {
             // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-            let config = self
+            let mut config = self
                 .config_manager
                 .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
                 .await
                 .map_err(|err| config_load_error(&err))?;
+            if restore_effort && inherited_effort == Some(None) {
+                config.model_reasoning_effort = None;
+            }
             StartThreadOptions {
                 client_mcp_extensions,
                 ..StartThreadOptions::new(config)
@@ -5696,7 +5782,9 @@ impl ThreadRequestProcessor {
             reserved_thread_id,
             ..options
         };
-        let new_thread = if let Some(prepared_fork) = prepared_fork {
+        let new_thread = if let Some(portable) = portable.take() {
+            self.thread_manager.fork_thread_from_portable_history(fork_options, portable).await
+        } else if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
                 .fork_prepared_thread(fork_options, prepared_fork)
                 .await
@@ -5806,6 +5894,24 @@ impl ThreadRequestProcessor {
         );
 
         let config_snapshot = forked_thread.config_snapshot().await;
+        if is_portable {
+            // The portable response is a durability receipt, not just a live runtime handle.
+            // Verify the final child-effective settings were persisted after its copied prefix;
+            // an append failure must not acknowledge a cold-resumable fork with foreign settings.
+            self.thread_store.persist_thread(thread_id, PersistContext::Standard).await
+                .map_err(|error| internal_error(format!("failed to persist portable fork: {error}")))?;
+            let durable = self.thread_store.load_latest_model_context(StoreLoadThreadHistoryParams {
+                thread_id, include_archived: true,
+            }).await.map_err(|error| internal_error(format!("failed to verify portable fork settings: {error}")))?;
+            let settings = forked_thread.thread_settings_snapshot().await;
+            let latest = durable.items.iter().rev().find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+                _ => None,
+            });
+            if !latest.is_some_and(|event| event.thread_id == Some(thread_id) && event.thread_settings == settings) {
+                return Err(internal_error("portable fork has no durable destination-effective settings"));
+            }
+        }
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so their visible history is projected before the source history is consumed.

@@ -182,7 +182,9 @@ impl Session {
             ensure_configs_stay_owner_provided(current_environments, &environments.environments)?;
         }
 
-        current.apply(updates, current_environments)
+        let next = current.apply(updates, current_environments)?;
+        self.validate_cache_preserving_effort(&current.step_settings, &next.step_settings)?;
+        Ok(next)
     }
 
     /// Activates the environments accepted for a new task. Configuration may have arrived for

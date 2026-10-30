@@ -565,7 +565,7 @@ pub(crate) async fn run_turn(
                 .map_err(CodexErr::Fatal)?;
             }
 
-            // Keep the override after accepted input so history truncation removes them together.
+            // Also covers effort changes between tool steps without new user input.
             sess.record_reasoning_effort_override(step_context.as_ref())
                 .await;
 
@@ -984,6 +984,10 @@ pub(crate) async fn run_hooks_and_record_inputs(
             }
             if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
                 accepted_user_input = true;
+                // Responses expects the update before the next user message.
+                // Record only accepted input so a blocked hook cannot change effort.
+                let settings = turn_context.next_step_settings.load_full();
+                sess.record_reasoning_effort_override_for_settings(turn_context.as_ref(), &settings).await;
             }
             // Tool outputs retain their durability barrier, including in mixed input batches.
             let input_persist_context = if persist_context == PersistContext::SteeredUserInput

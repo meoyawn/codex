@@ -9,6 +9,7 @@ mod model_context;
 mod move_thread_to_section;
 mod paginated_fork;
 mod pending_thread_metadata;
+mod portable_history;
 mod projects;
 mod read_thread;
 mod revert_thread;
@@ -637,6 +638,34 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
+    }
+
+    fn supports_portable_history(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    fn export_portable_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, crate::portable_history::PortableHistoryArtifact> {
+        Box::pin(async move { portable_history::export(self, thread_id).await })
+    }
+
+    fn append_portable_history(
+        &self,
+        thread_id: ThreadId,
+        lines: Vec<codex_rollout::RolloutLine>,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { live_writer::append_portable_history(self, thread_id, lines).await })
+    }
+
+    fn append_portable_history_batch(
+        &self,
+        thread_id: ThreadId,
+        lines: Vec<codex_rollout::RolloutLine>,
+        continuation: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { live_writer::append_portable_history_batch(self, thread_id, lines, continuation).await })
     }
 
     fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {

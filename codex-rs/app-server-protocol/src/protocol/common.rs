@@ -583,6 +583,26 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadSampleCancelResponse,
     },
+    // Additive local extension; never send these methods without the initialize capability.
+    #[experimental("dev.harness.portableHistory")]
+    ThreadPortableHistoryExport => "harness/thread/portableHistory/export" {
+        params: v2::ThreadPortableHistoryExportParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadPortableHistoryExportResponse,
+    },
+    #[experimental("dev.harness.portableHistory")]
+    ThreadPortableHistoryRelease => "harness/thread/portableHistory/release" {
+        params: v2::ThreadPortableHistoryReleaseParams,
+        serialization: None,
+        response: v2::ThreadPortableHistoryReleaseResponse,
+    },
+    #[experimental("dev.harness.portableHistory")]
+    ThreadPortableHistoryImport => "harness/thread/portableHistory/import" {
+        params: v2::ThreadPortableHistoryImportParams,
+        serialization: thread_id(params.source_thread_id),
+        manual_payload_conversion: manual,
+        response: v2::ThreadForkResponse,
+    },
     ThreadArchive => "thread/archive" {
         params: v2::ThreadArchiveParams,
         serialization: thread_id(params.thread_id),

@@ -1,20 +1,25 @@
-//! Cache-preserving effort updates and the request-effort baseline for a context window.
+//! Cache-preserving effort updates and the conversation's request-effort baseline.
 //!
 //! Only trusted harness items establish overrides. Replay preserves startup prewarm's
 //! baseline while it is retained.
-//! Successful compaction retires the overrides and allows a fresh request baseline.
+//! Compaction preserves the request baseline and reasserts the selected effort with a new item.
 //! Fixed-effort workers always use their selected request-level effort.
 //! Unsupported models use selected request effort without rewriting saved updates.
 
 use super::session::Session;
 use super::step_context::StepContext;
 use super::step_settings::ResolvedStepSettings;
+use super::step_settings::StepSettings;
+use super::turn_context::TurnContext;
+use crate::config::ConstraintError;
+use crate::config::ConstraintResult;
 use crate::state::ReasoningEffortPin;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ModelInfo;
 
 /// Sampling can establish a pin; compaction must not change live state before it succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,26 +29,63 @@ pub(crate) enum RequestEffortUsage {
 }
 
 impl Session {
+    /// Reject effort changes unless this session can express them as history items.
+    /// Use the startup catalog snapshot, not a later catalog refresh.
+    pub(super) fn validate_cache_preserving_effort(
+        &self,
+        current: &StepSettings,
+        next: &StepSettings,
+    ) -> ConstraintResult<()> {
+        if current.collaboration_mode.reasoning_effort() == next.collaboration_mode.reasoning_effort() {
+            return Ok(());
+        }
+        let model = self.services.thread_extension_data.get::<ModelInfo>();
+        if let Some(model) = model {
+            let resolve = |settings: &StepSettings| {
+                settings.collaboration_mode.reasoning_effort()
+                    .or_else(|| model.default_reasoning_level.clone())
+                    .map(|effort| model.resolve_reasoning_effort(effort))
+            };
+            let previous = resolve(current);
+            let selected = resolve(next);
+            if previous == selected {
+                return Ok(());
+            }
+            if self.services.model_client.reasoning_effort_override_enabled(&model)
+                && selected.is_some_and(|effort| !matches!(effort, ReasoningEffort::Custom(value) if value != "disabled"))
+            {
+                return Ok(());
+            }
+        }
+        Err(ConstraintError::PromptCacheInvalidation { field_name: "reasoning effort" })
+    }
+
     /// Establishes the selected effort in surviving history, independent of replayed settings.
     pub(crate) async fn record_reasoning_effort_override(&self, step_context: &StepContext) {
-        let settings = &step_context.settings;
+        self.record_reasoning_effort_override_for_settings(step_context.turn.as_ref(), &step_context.settings).await;
+    }
+
+    pub(super) async fn record_reasoning_effort_override_for_settings(
+        &self,
+        turn: &TurnContext,
+        settings: &ResolvedStepSettings,
+    ) {
         let Some(effort) = self.effort_for_configuration_update(settings) else {
             return;
         };
-        let should_skip = {
-            let mut state = self.state.lock().await;
-            if matches!(state.reasoning_effort_pin, ReasoningEffortPin::Compacted) {
-                // Only successful compaction allows the request baseline to establish
-                // the selection without another update.
-                state
-                    .reasoning_effort_pin
-                    .pin(&settings.model_info.slug, effort.clone());
-            }
+        let (should_skip, request_effort) = {
+            let state = self.state.lock().await;
+            let compacted = state.history.annotated_items().iter().any(|envelope| matches!(
+                envelope.item, ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+            ));
             let latest_override = state
                 .history
                 .annotated_items()
                 .iter()
                 .rev()
+                .take_while(|envelope| !matches!(
+                    envelope.item, ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+                ))
                 .enumerate()
                 .find_map(|(index, envelope)| {
                     if !envelope
@@ -62,27 +104,29 @@ impl Session {
                 });
             // Recovery adds no user message. Reuse a matching trusted tail update even
             // before this runtime establishes its pin, rather than append adjacent updates.
-            latest_override.is_some_and(|(index, established)| index == 0 && established == &effort)
+            let skip = latest_override.is_some_and(|(index, established)| index == 0 && established == &effort)
                 || state
                     .reasoning_effort_pin
                     .get(&settings.model_info.slug)
                     .is_some_and(|pinned| {
-                        latest_override.map_or(&pinned, |(_, established)| established) == &effort
-                    })
+                        latest_override.map_or(!compacted && pinned == effort, |(_, established)| established == &effort)
+                    });
+            (skip, state.reasoning_effort_pin.get(&settings.model_info.slug).unwrap_or_else(|| effort.clone()))
         };
         if should_skip {
             return;
         }
 
         self.record_annotated_conversation_items(
-            step_context.turn.as_ref(),
-            &step_context.settings.model_info,
+            turn,
+            &settings.model_info,
             vec![ResponseItemEnvelope {
                 item: ResponseItem::ConfigurationUpdate {
                     reasoning: ConfigurationReasoning { effort },
                 },
                 metadata: Some(CodexHarnessMetadata {
                     harness_authored_configuration: true,
+                    request_reasoning_effort: Some(request_effort),
                     ..Default::default()
                 }),
             }],
@@ -90,7 +134,7 @@ impl Session {
         .await;
     }
 
-    /// Sampling and compaction share the original request effort for this context window.
+    /// Sampling and compaction share the conversation's original request effort.
     pub(crate) async fn reasoning_effort_for_request(
         &self,
         settings: &ResolvedStepSettings,

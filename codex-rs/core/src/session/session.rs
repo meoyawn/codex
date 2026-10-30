@@ -712,6 +712,40 @@ impl Session {
         Arc::clone(&state.session_configuration.dynamic_tools)
     }
 
+    /// Client capabilities apply to the next captured TurnContext. Never
+    /// replace the toolset of an already-running turn or remove other tools.
+    pub(crate) async fn upsert_dynamic_tools(&self, tools: Vec<DynamicToolSpec>) {
+        let mut state = self.state.lock().await;
+        let mut current = state.session_configuration.dynamic_tools.to_vec();
+        for tool in tools {
+            match tool {
+                DynamicToolSpec::Namespace(incoming) => {
+                    if let Some(DynamicToolSpec::Namespace(existing)) = current.iter_mut().find(|spec| {
+                        matches!(spec, DynamicToolSpec::Namespace(namespace) if namespace.name == incoming.name)
+                    }) {
+                        existing.description = incoming.description;
+                        for function in incoming.tools {
+                            let codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(incoming_function) = &function;
+                            if let Some(slot) = existing.tools.iter_mut().find(|candidate| {
+                                let codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(candidate) = candidate;
+                                candidate.name == incoming_function.name
+                            }) { *slot = function; } else { existing.tools.push(function); }
+                        }
+                    } else { current.push(DynamicToolSpec::Namespace(incoming)); }
+                }
+                DynamicToolSpec::Function(incoming) => {
+                    if let Some(slot) = current.iter_mut().find(|spec| {
+                        matches!(spec, DynamicToolSpec::Function(function) if function.name == incoming.name)
+                    }) { *slot = DynamicToolSpec::Function(incoming); }
+                    else { current.push(DynamicToolSpec::Function(incoming)); }
+                }
+            }
+        }
+        state.session_configuration.dynamic_tools = current.into();
+        drop(state);
+        self.mark_mcp_runtime_dirty();
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         step_context: &StepContext,
@@ -835,7 +869,7 @@ impl Session {
         agent_status: watch::Sender<AgentStatus>,
         mut initial_history: InitialHistory,
         history_initialization: HistoryInitialization,
-        fork_persistence: ForkPersistence,
+        mut fork_persistence: ForkPersistence,
         session_source: SessionSource,
         skills_service: Arc<HostSkillsService>,
         plugins_manager: Arc<PluginsManager>,
@@ -896,6 +930,7 @@ impl Session {
             ForkPersistence::Referenced { history_base, .. } => {
                 history_base.map(|position| position.end_ordinal_exclusive)
             }
+            ForkPersistence::Portable { .. } => None,
             ForkPersistence::Copied | ForkPersistence::CopiedDeferred => match &initial_history {
                 InitialHistory::Resumed(resumed) => {
                     // Both local and CCA thread stores place the resumed thread's
@@ -1116,7 +1151,7 @@ impl Session {
                             multi_agent_version: initial_multi_agent_version,
                             history_mode: session_configuration.history_mode,
                             history_base: match &fork_persistence {
-                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred => None,
+                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred | ForkPersistence::Portable { .. } => None,
                                 ForkPersistence::Referenced { history_base, .. } => *history_base,
                             },
                             subagent_history_start_ordinal: None,
@@ -1134,7 +1169,18 @@ impl Session {
                                 },
                             },
                         };
-                        if is_paginated_subagent
+                        if let ForkPersistence::Portable { replay, inherited_item_count } = &mut fork_persistence {
+                            let InitialHistory::Forked(items) = &initial_history else {
+                                return Err(anyhow::anyhow!("portable persistence requires copied fork history"));
+                            };
+                            let replay = replay.take().ok_or_else(|| anyhow::anyhow!("portable prefix was already consumed"))?;
+                            if is_paginated_subagent || *inherited_item_count > items.len() {
+                                return Err(anyhow::anyhow!("invalid portable root prefix"));
+                            }
+                            LiveThread::create_with_portable_replay(
+                                Arc::clone(&thread_store), params, replay, &items[..*inherited_item_count], guard,
+                            ).await?
+                        } else if is_paginated_subagent
                             && matches!(
                                 &fork_persistence,
                                 ForkPersistence::Copied | ForkPersistence::CopiedDeferred
@@ -2023,8 +2069,10 @@ impl Session {
                 &inherited_environments,
                 &session_configuration.environments,
             );
-            sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
-                .await;
+            let restoring_history = matches!(&initial_history, InitialHistory::Resumed(_) | InitialHistory::Forked(_));
+            if !restoring_history {
+                sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base).await;
+            }
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
                     codex_hooks::SessionStartSource::Fork
@@ -2040,13 +2088,18 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            if restoring_history {
+                // Restore the historical request effort before warmup can pin the
+                // latest selected effort and invalidate the earlier prompt prefix.
+                sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base).await;
+            }
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,
                     initial_auto_compact_window_ids,
                 );
             }
-            if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
+            if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. } | ForkPersistence::Portable { .. }) {
                 // Keep the source reserved until the child's history reference is durable.
                 sess.try_ensure_rollout_materialized(PersistContext::Standard)
                     .await?;

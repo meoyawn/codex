@@ -11,7 +11,7 @@ use std::time::Instant;
 
 struct Active {
     instance: u64,
-    handle: v8::IsolateHandle,
+    handle: super::engine::ExecutionHandle,
     deadline: Instant,
     terminated: bool,
 }
@@ -69,7 +69,7 @@ impl IsolateExecutionWatchdog {
         })
     }
 
-    pub(super) fn arm(&self, instance: u64, handle: v8::IsolateHandle) {
+    pub(super) fn arm(&self, instance: u64, handle: super::engine::ExecutionHandle) {
         let (lock, changed) = &*self.observer.0;
         let mut state = lock
             .lock()

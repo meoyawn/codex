@@ -108,6 +108,11 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub harness_authored_configuration: bool,
 
+    /// Original request-level effort for this conversation. Kept outside the
+    /// API item so cold resumes can replay overrides without changing the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+
     /// Producer compatibility for an opaque compaction item, never the currently selected model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_hash: Option<String>,
@@ -396,6 +401,20 @@ pub enum InitialHistory {
     Cleared,
     Resumed(ResumedHistory),
     Forked(Vec<RolloutItem>),
+}
+
+/// Model and effort selected at the retained history boundary. Fork callers must
+/// pass the truncated history so an earlier-turn fork inherits that turn's settings.
+pub fn latest_model_settings(
+    items: &[RolloutItem],
+) -> Option<(&str, Option<&codex_protocol::openai_models::ReasoningEffort>)> {
+    items.iter().rev().find_map(|item| match item {
+        RolloutItem::TurnContext(context) => Some((context.model.as_str(), context.effort.as_ref())),
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some((
+            event.thread_settings.model.as_str(), event.thread_settings.reasoning_effort.as_ref(),
+        )),
+        _ => None,
+    })
 }
 
 impl InitialHistory {

@@ -439,7 +439,8 @@ pub fn effective_mcp_servers_from_configured(
                     server,
                     registration.credential_policy(),
                 )
-                .with_agent_plugin(registration.source().is_agent_plugin()),
+                .with_agent_plugin(registration.source().is_agent_plugin())
+                .with_shared_stdio_scope(registration.shared_stdio_scope()),
             )
         })
         .collect::<HashMap<_, _>>();

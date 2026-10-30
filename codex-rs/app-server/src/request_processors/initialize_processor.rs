@@ -27,6 +27,7 @@ pub(crate) struct InitializeRequestProcessor {
     config: Arc<Config>,
     rpc_transport: AppServerRpcTransport,
     user_verification: Arc<crate::user_verification::Service>,
+    portable_history_available: bool,
 }
 
 impl InitializeRequestProcessor {
@@ -38,6 +39,7 @@ impl InitializeRequestProcessor {
         config: Arc<Config>,
         rpc_transport: AppServerRpcTransport,
         user_verification: Arc<crate::user_verification::Service>,
+        portable_history_available: bool,
     ) -> Self {
         Self {
             gateway_login_control,
@@ -47,6 +49,7 @@ impl InitializeRequestProcessor {
             config,
             rpc_transport,
             user_verification,
+            portable_history_available,
         }
     }
 
@@ -80,6 +83,24 @@ impl InitializeRequestProcessor {
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let extensions = capabilities.extensions.as_ref();
+        let client_tools = extensions.and_then(|extensions| extensions.get("dev.harness.clientTools"))
+            .filter(|offer| experimental_api_enabled && offer.get("version").and_then(serde_json::Value::as_u64) == Some(1))
+            .map(|_| codex_app_server_protocol::ClientToolsCapability { version: 1, dynamic_tools_on_resume: true, in_process_app_mcp: true });
+        let harness_build = extensions.and_then(|extensions| extensions.get("dev.harness.buildIdentity"))
+            .filter(|offer| offer.get("version").and_then(serde_json::Value::as_u64) == Some(1))
+            .and_then(|_| Some(codex_app_server_protocol::HarnessBuildIdentity {
+                version: 1,
+                source_commit: option_env!("STABLE_GIT_COMMIT")?.to_string(),
+                source_fingerprint_sha256: option_env!("HARNESS_SOURCE_FINGERPRINT_SHA256")?.to_string(),
+                package_version: env!("CARGO_PKG_VERSION").to_string(),
+                cargo_profile: option_env!("HARNESS_CARGO_PROFILE")?.to_string(),
+            }));
+        let portable_history_enabled = self.portable_history_available && experimental_api_enabled
+            && extensions.and_then(|extensions| extensions.get(codex_app_server_protocol::PORTABLE_HISTORY_EXTENSION))
+                .is_some_and(|offer| {
+                    offer.get("version").and_then(serde_json::Value::as_u64) == Some(u64::from(codex_app_server_protocol::PORTABLE_HISTORY_VERSION))
+                        && offer.get("rolloutSchema").and_then(serde_json::Value::as_str) == Some(codex_app_server_protocol::PORTABLE_HISTORY_ROLLOUT_SCHEMA)
+                });
         let mut client_mcp_extensions = codex_mcp::client_mcp_extensions(
             extensions,
             capabilities.mcp_server_openai_form_elicitation,
@@ -131,6 +152,7 @@ impl InitializeRequestProcessor {
         if session
             .initialize(InitializedConnectionSessionState {
                 experimental_api_enabled,
+                portable_history_enabled,
                 opted_out_notification_methods: opt_out_notification_methods.into_iter().collect(),
                 app_server_client_name: name.clone(),
                 client_version: version,
@@ -212,6 +234,9 @@ impl InitializeRequestProcessor {
             codex_home,
             platform_family: std::env::consts::FAMILY.to_string(),
             platform_os: std::env::consts::OS.to_string(),
+            portable_history: portable_history_enabled.then(codex_app_server_protocol::PortableHistoryCapability::v1),
+            harness_build,
+            client_tools,
         };
 
         self.outgoing

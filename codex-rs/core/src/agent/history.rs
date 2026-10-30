@@ -187,6 +187,12 @@ pub(super) async fn prepare_forked_history(
 
     let parent_thread_id = *parent_thread_id;
     let parent_thread = state.get_thread(parent_thread_id).await?;
+    let parent_model = parent_thread.config_snapshot().await.model;
+    if config.model.as_deref().is_some_and(|model| model != parent_model) {
+        return Err(CodexErr::InvalidRequest(format!(
+            "A history fork must keep the parent's model `{parent_model}` to preserve its prompt cache. Spawn without inherited history to use another model."
+        )));
+    }
     let (subagent_developer_instructions, parent_developer_instructions) = match (
         multi_agent_version,
         config
