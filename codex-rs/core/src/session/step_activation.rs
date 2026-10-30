@@ -412,7 +412,7 @@ impl Session {
                 environments,
             ),
         };
-        current
+        let next = current
             .apply_update(
                 update,
                 &constraints,
@@ -421,7 +421,10 @@ impl Session {
                 &self.features,
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.validate_cache_preserving_effort(current.selected(), next.selected())
+            .map_err(|error| error.to_string())?;
+        Ok(next)
     }
 
     /// Rechecks ordinary managed authorization after asynchronous resolution.

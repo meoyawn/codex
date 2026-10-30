@@ -1412,6 +1412,9 @@ pub(crate) async fn make_rmcp_client(
     runtime_auth_provider: Option<SharedAuthProvider>,
     protocol_mode: McpProtocolMode,
 ) -> Result<RmcpClient, StartupOutcomeError> {
+    if let Some(factory) = server.in_process_transport() {
+        return RmcpClient::new_in_process_client(factory).await.map_err(|error| StartupOutcomeError::from(anyhow!(error)));
+    }
     let config = server.config().clone();
     if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
         // Executor HTTP declarations cannot acquire host header helpers through
@@ -1481,9 +1484,11 @@ pub(crate) async fn make_rmcp_client(
                 // TODO(starr): Unify local stdio MCP launch with
                 // `ExecutorStdioServerLauncher` once the executor-backed path
                 // preserves `LocalStdioServerLauncher` semantics.
-                Arc::new(LocalStdioServerLauncher::new(
-                    runtime_context.local_process_cwd(),
-                )) as Arc<dyn StdioServerLauncher>
+                let mut launcher = LocalStdioServerLauncher::new(runtime_context.local_process_cwd());
+                if let Some(scope) = server.shared_stdio_scope() {
+                    launcher = launcher.with_shared_scope(scope.clone(), server.config().tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT));
+                }
+                Arc::new(launcher) as Arc<dyn StdioServerLauncher>
             } else {
                 let Some(environment) = resolved_environment.as_ref() else {
                     unreachable!(

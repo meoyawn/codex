@@ -353,6 +353,12 @@ pub struct ThreadSettingsUpdatedNotification {
 /// Prefer using thread_id whenever possible.
 pub struct ThreadResumeParams {
     pub thread_id: String,
+    /// Local dev.harness.clientTools v1: upsert client tool definitions for
+    /// subsequent turns, preserving unrelated definitions and active turns.
+    #[experimental("thread/resume.dynamicTools")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "codex_protocol::dynamic_tools::deserialize_dynamic_tool_specs")]
+    #[ts(optional = nullable)]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
 
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
     /// If specified, the thread will be resumed with the provided history

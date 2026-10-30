@@ -1024,6 +1024,12 @@ impl ContextManager {
     ) -> usize {
         while cut_idx > first_instruction_turn_idx {
             match &snapshot[cut_idx - 1].item {
+                ResponseItem::ConfigurationUpdate { .. }
+                    if snapshot[cut_idx - 1].metadata.as_ref()
+                        .is_some_and(|metadata| metadata.harness_authored_configuration) =>
+                {
+                    cut_idx -= 1;
+                }
                 ResponseItem::Message {
                     role,
                     content,

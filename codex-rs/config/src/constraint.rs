@@ -19,6 +19,9 @@ pub enum ConstraintError {
     #[error("To use model `{model}`, you need to use auto review.")]
     AutoReviewRequired { model: String },
 
+    #[error("Cannot change {field_name} in an existing conversation without invalidating its prompt cache. Start a new conversation to change it.")]
+    PromptCacheInvalidation { field_name: &'static str },
+
     #[error("field `{field_name}` cannot be empty")]
     EmptyField { field_name: String },
 

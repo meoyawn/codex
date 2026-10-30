@@ -16,10 +16,7 @@ use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
-use rmcp::transport::async_rw::AsyncRwTransport;
-use tokio::io::AsyncRead;
 use tokio::process::ChildStderr;
-use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
 use crate::bounded_stdio_transport::BoundedStdioTransport;
@@ -137,8 +134,8 @@ impl Discovery {
 }
 
 enum StdioTransport {
-    /// Preserve rmcp's existing framing for servers using the initialize handshake.
-    Legacy(AsyncRwTransport<RoleClient, Box<dyn AsyncRead + Unpin + Send>, ChildStdin>),
+    /// Oversized legacy frames must close the shared connection and fail its requests.
+    Legacy(BoundedStdioTransport),
     /// Bound frames and skip messages unknown to the client during 2026-07-28 discovery.
     Modern(BoundedStdioTransport),
     Closed,
@@ -161,10 +158,10 @@ impl LocalStdioTransport {
         let stderr = child.stderr.take();
         let transport = match protocol_mode {
             McpProtocolMode::Legacy => {
-                StdioTransport::Legacy(AsyncRwTransport::new(Box::new(stdout), stdin))
+                StdioTransport::Legacy(BoundedStdioTransport::new(stdin, stdout, program_name, protocol_mode))
             }
             McpProtocolMode::V20260728 | McpProtocolMode::DiscoverLocalStdio => {
-                StdioTransport::Modern(BoundedStdioTransport::new(stdin, stdout, program_name))
+                StdioTransport::Modern(BoundedStdioTransport::new(stdin, stdout, program_name, protocol_mode))
             }
         };
         Ok((
@@ -234,13 +231,8 @@ impl Transport<RoleClient> for LocalStdioTransport {
             else {
                 unreachable!();
             };
-            match transport.into_legacy_pipes() {
-                Ok((stdout, stdin)) => {
-                    probe.initialize_id = Some(request.id.clone());
-                    self.transport = StdioTransport::Legacy(AsyncRwTransport::new(stdout, stdin));
-                }
-                Err(error) => return futures::future::err(error).boxed(),
-            }
+            probe.initialize_id = Some(request.id.clone());
+            self.transport = StdioTransport::Legacy(transport.into_legacy());
         }
         match &mut self.transport {
             StdioTransport::Legacy(transport) => transport.send(item).boxed(),

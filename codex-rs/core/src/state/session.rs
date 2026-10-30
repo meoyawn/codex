@@ -33,11 +33,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 /// Runtime request effort, inherited from a parent or established by prewarm or sampling.
-/// Successful compaction allows a fresh baseline without an override.
+/// Compaction preserves this baseline; the selected effort is reasserted in history.
 #[derive(Clone)]
 pub(crate) enum ReasoningEffortPin {
     Unset,
-    Compacted,
     Active {
         model: String,
         effort: ReasoningEffort,
@@ -51,7 +50,7 @@ impl ReasoningEffortPin {
                 model: pinned_model,
                 effort,
             } if pinned_model == model => Some(effort.clone()),
-            Self::Unset | Self::Compacted | Self::Active { .. } => None,
+            Self::Unset | Self::Active { .. } => None,
         }
     }
 

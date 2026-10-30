@@ -1,4 +1,4 @@
-//! Bounded, compatibility-aware transport for modern locally spawned MCP servers.
+//! Bounded, compatibility-aware transport for locally spawned MCP servers.
 
 use std::future::Future;
 use std::io;
@@ -20,23 +20,39 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use tracing::warn;
 
+use crate::protocol_mode::McpProtocolMode;
+
 /// Match the existing executor stdio transport and the production MCP limit.
 pub(crate) const MAX_MCP_STDIO_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+pub(super) fn stdio_line_limit(protocol_mode: McpProtocolMode) -> usize {
+    match protocol_mode {
+        McpProtocolMode::Legacy => rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH,
+        McpProtocolMode::V20260728 | McpProtocolMode::DiscoverLocalStdio => MAX_MCP_STDIO_LINE_BYTES,
+    }
+}
 
 pub(super) struct BoundedStdioTransport {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdout: BufReader<ChildStdout>,
     pending_line: Vec<u8>,
     program_name: String,
+    max_line_bytes: usize,
 }
 
 impl BoundedStdioTransport {
-    pub(super) fn new(stdin: ChildStdin, stdout: ChildStdout, program_name: String) -> Self {
+    pub(super) fn into_legacy(mut self) -> Self {
+        self.max_line_bytes = stdio_line_limit(McpProtocolMode::Legacy);
+        self
+    }
+
+    pub(super) fn new(stdin: ChildStdin, stdout: ChildStdout, program_name: String, protocol_mode: McpProtocolMode) -> Self {
         Self {
             stdin: Arc::new(Mutex::new(Some(stdin))),
             stdout: BufReader::new(stdout),
             pending_line: Vec::new(),
             program_name,
+            max_line_bytes: stdio_line_limit(protocol_mode),
         }
     }
 
@@ -76,9 +92,10 @@ impl BoundedStdioTransport {
 
             let newline = memchr(b'\n', bytes);
             let content_len = newline.unwrap_or(bytes.len());
-            if content_len > MAX_MCP_STDIO_LINE_BYTES.saturating_sub(self.pending_line.len()) {
+            if content_len > self.max_line_bytes.saturating_sub(self.pending_line.len()) {
                 warn!(
-                    "MCP stdio line exceeds {MAX_MCP_STDIO_LINE_BYTES} bytes ({}); closing transport",
+                    "MCP stdio line exceeds {} bytes ({}); closing transport so pending requests fail",
+                    self.max_line_bytes,
                     self.program_name
                 );
                 self.pending_line.clear();

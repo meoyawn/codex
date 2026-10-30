@@ -292,6 +292,42 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    /// Local extension readiness: complete raw lineage, immutable export and timestamp-preserving import.
+    fn supports_portable_history(&self) -> bool {
+        false
+    }
+
+    fn export_portable_history(
+        &self,
+        _thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, crate::portable_history::PortableHistoryArtifact> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported { operation: "portable_history" })
+        })
+    }
+
+    /// Append an already validated portable prefix while retaining original timestamps.
+    /// Ordinals are allocated by the new destination's recorder, never copied from the source.
+    fn append_portable_history(
+        &self,
+        _thread_id: ThreadId,
+        _lines: Vec<codex_rollout::RolloutLine>,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported { operation: "portable_history" })
+        })
+    }
+
+    fn append_portable_history_batch(
+        &self,
+        thread_id: ThreadId,
+        lines: Vec<codex_rollout::RolloutLine>,
+        continuation: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        if !continuation { return self.append_portable_history(thread_id, lines); }
+        Box::pin(async { Err(ThreadStoreError::Unsupported { operation: "portable_history_stream" }) })
+    }
+
     /// Reverts a paginated thread's durable history so it ends immediately before
     /// `before_turn_id`.
     ///

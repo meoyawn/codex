@@ -260,6 +260,7 @@ pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
 mod input_queue;
 mod mcp;
+mod app_tools_mcp;
 mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
@@ -448,6 +449,12 @@ pub(crate) enum GitEnrichmentPolicy {
 /// Controls which fork history belongs in the newly created thread's own rollout.
 pub(crate) enum ForkPersistence {
     Copied,
+    /// Complete raw copied replay from another host, with original record timestamps.
+    Portable {
+        // Consumed during startup acquisition; the live session retains only the prefix count.
+        replay: Option<codex_thread_store::portable_history::PortableHistoryReplay>,
+        inherited_item_count: usize,
+    },
     /// The spawn caller owns the durability barrier before acknowledging the child.
     CopiedDeferred,
     Referenced {
@@ -763,6 +770,14 @@ impl Session {
                 "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
             ));
         }
+        let inherited_model_settings = codex_history::latest_model_settings(conversation_history.get_rollout_items());
+        if let Some((inherited_model, _)) = inherited_model_settings
+            && inherited_model != model
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "This conversation uses model `{inherited_model}`. Resuming or forking with `{model}` would invalidate its prompt cache. Start a new conversation to use another model."
+            )));
+        }
         let trusted_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source)
             && !matches!(conversation_history, InitialHistory::Resumed(_));
         if config
@@ -816,6 +831,21 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        if let Some((_, inherited_effort)) = inherited_model_settings {
+            let resolve = |effort: Option<ReasoningEffortConfig>| {
+                effort.or_else(|| model_info.default_reasoning_level.clone())
+                    .map(|effort| model_info.resolve_reasoning_effort(effort))
+            };
+            if resolve(inherited_effort.cloned()) != resolve(config.model_reasoning_effort.clone())
+                && !(config.features.enabled(Feature::ReasoningEffortOverride)
+                    && config.model_provider.is_openai()
+                    && model_info.supports_reasoning_effort_updates)
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "This model cannot change reasoning effort while preserving the conversation's prompt cache. Keep the inherited effort or start a new conversation.".to_string(),
+                ));
+            }
+        }
         let auth = auth_manager.auth_cached();
         // Forked subagents keep their parent's activation with the copied history.
         // Fresh children restore configured preferences before applying startup defaults.
@@ -1781,6 +1811,13 @@ impl Session {
                 let thread_settings_applied =
                     RolloutItem::EventMsg(thread_settings::applied_event(self).await);
                 match &self.fork_persistence {
+                    ForkPersistence::Portable { inherited_item_count, .. } => {
+                        // The startup acquisition guard already persisted the complete raw prefix
+                        // with original timestamps. Persist only destination-effective settings and
+                        // any interrupt marker synthesized after that prefix.
+                        rollout_items.drain(..*inherited_item_count);
+                        rollout_items.insert(0, thread_settings_applied);
+                    }
                     ForkPersistence::Referenced {
                         inherited_item_count,
                         ..
@@ -1821,7 +1858,7 @@ impl Session {
                 // Agent spawn owns its final durability barrier so it can overlap the edge write.
                 let persist_context = match self.fork_persistence {
                     ForkPersistence::CopiedDeferred => PersistContext::SubagentSpawn,
-                    ForkPersistence::Copied | ForkPersistence::Referenced { .. } => {
+                    ForkPersistence::Copied | ForkPersistence::Portable { .. } | ForkPersistence::Referenced { .. } => {
                         PersistContext::Standard
                     }
                 };
@@ -1926,6 +1963,22 @@ impl Session {
         };
         {
             let mut state = self.state.lock().await;
+            if matches!(state.reasoning_effort_pin, ReasoningEffortPin::Unset) {
+                let baseline = history.iter().find_map(|envelope| {
+                    let metadata = envelope.metadata.as_ref()?;
+                    if let Some(effort) = &metadata.request_reasoning_effort {
+                        return Some(effort.clone());
+                    }
+                    if !metadata.harness_authored_configuration { return None; }
+                    let ResponseItem::ConfigurationUpdate { reasoning } = &envelope.item else { return None; };
+                    // Legacy histories recorded the initial selection as their first
+                    // update; new histories persist the exact request baseline too.
+                    Some(reasoning.effort.clone())
+                });
+                if let Some(effort) = baseline {
+                    state.reasoning_effort_pin.pin(&turn_context.model_info().slug, effort);
+                }
+            }
             state.replace_annotated_history(
                 history,
                 reference_context_item,
@@ -4539,6 +4592,13 @@ impl Session {
                         .cloned(),
                 );
             }
+            // Keep the hidden request prefix stable through compaction and cold
+            // resume. This metadata is local bookkeeping, never an API item.
+            if let Some(effort) = state.reasoning_effort_pin.get(&reference_context_item.model)
+                && let Some(first) = items.first_mut()
+            {
+                first.metadata.get_or_insert_default().request_reasoning_effort = Some(effort);
+            }
             let replacement_history = items.clone();
             state.replace_annotated_history(
                 items,
@@ -4547,7 +4607,6 @@ impl Session {
                     reviewer_compaction_hash: metadata.reviewer_compaction_hash,
                 },
             );
-            state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
             state
                 .history
                 .set_world_state_baseline(world_state_baseline.clone());
